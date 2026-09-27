@@ -1,0 +1,11 @@
+# SwiftPM build artifacts
+.build/
+dist/
+
+# macOS
+.DS_Store
+
+# Stray --render output files (contain real local usage data)
+--out
+--tab
+*.png
