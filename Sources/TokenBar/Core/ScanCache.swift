@@ -235,10 +235,11 @@ extension Data {
 enum Needles {
     static let usage = Array("\"usage\"".utf8)
     static let tokenCount = Array("\"token_count\"".utf8)
+    static let tokenUsageRecord = Array("\"token_usage_record\"".utf8)
     static let turnContext = Array("\"turn_context\"".utf8)
     static let sessionMeta = Array("\"session_meta\"".utf8)
     /// Every Codex line that can change the reducer's output.
-    static let codexRelevant = [tokenCount, turnContext, sessionMeta]
+    static let codexRelevant = [tokenCount, tokenUsageRecord, turnContext, sessionMeta]
 }
 
 // MARK: - Scan cache
@@ -265,7 +266,9 @@ enum Needles {
 /// files — copied transcripts used to bill every copy. v8 counts Codex
 /// subagent-thread usage as normal usage: v7 marked it `isSidechain`, which
 /// dropped real billed tokens whenever the sidechain filter was on.
-private let scanCacheVersion = 8
+/// v9 also reads modern `token_usage_record` rows and reconciles their legacy
+/// mirrors without mixing the two formats' independent cumulative counters.
+private let scanCacheVersion = 10
 
 /// Per-file memo of a previous scan, keyed by identity + mtime + size.
 struct CachedFileScan: Codable {
@@ -358,12 +361,39 @@ final class ScanCache {
     init(url: URL = ScanCache.defaultURL) {
         self.url = url
         if let data = try? Data(contentsOf: url),
-           let decoded = try? JSONDecoder().decode(Persisted.self, from: data),
-           decoded.version == scanCacheVersion {
+           let decoded = try? JSONDecoder().decode(Persisted.self, from: data) {
             entries = decoded.files
+            // Reparse available logs after parser upgrades, but keep the only
+            // surviving evidence for logs that have been removed.
+            if decoded.version != scanCacheVersion {
+                for path in entries.keys where FileManager.default.fileExists(atPath: path) {
+                    entries[path]?.mtime = -1
+                    entries[path]?.position = nil
+                    entries[path]?.codexState = nil
+                }
+                dirty = true
+            }
         } else {
             entries = [:]
         }
+    }
+
+    /// History already observed under this configured root. A deleted log must
+    /// not silently erase consumption; collectors still deduplicate these rows.
+    func retainedPaths(under root: String) -> [String] {
+        let prefix = root.hasSuffix("/") ? root : root + "/"
+        lock.lock(); defer { lock.unlock() }
+        return entries.keys.filter { $0 == root || $0.hasPrefix(prefix) }.sorted()
+    }
+
+    func retainedState(for path: String) -> CodexScanState? {
+        lock.lock(); defer { lock.unlock() }
+        return entries[path]?.codexState
+    }
+
+    func missingPathCount(under roots: [String]) -> Int {
+        Set(roots.flatMap { retainedPaths(under: $0) })
+            .filter { !FileManager.default.fileExists(atPath: $0) }.count
     }
 
     /// Stat signature of a set of files, folding in size and mtime.
@@ -395,7 +425,10 @@ final class ScanCache {
     func buckets(for path: String,
                  sidecars: [String] = [],
                  compute: (UInt64) -> [UsageBucket]) -> [UsageBucket] {
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path) else { return [] }
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path) else {
+            lock.lock(); defer { lock.unlock() }
+            return entries[path]?.buckets ?? []
+        }
         let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
         let mtime = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
         let inode = (attrs[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
@@ -434,15 +467,21 @@ final class ScanCache {
     /// deterministic order and collapses on `rid`. This method only guarantees
     /// "events for this file's current bytes" is cached.
     func events(for path: String,
+                sidecars: [String] = [],
                 compute: () -> [UsageEventRecord]) -> [UsageEventRecord] {
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path) else { return [] }
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path) else {
+            lock.lock(); defer { lock.unlock() }
+            return entries[path]?.events ?? []
+        }
         let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
         let mtime = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
         let inode = (attrs[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
+        let signature = Self.signature(of: sidecars)
+        let storedSignature = signature.isEmpty ? nil : signature
 
         lock.lock()
         if let hit = entries[path], hit.size == size, hit.mtime == mtime,
-           hit.inode == inode, let events = hit.events {
+           hit.inode == inode, hit.sidecarSignature == storedSignature, let events = hit.events {
             lock.unlock()
             return events
         }
@@ -453,7 +492,7 @@ final class ScanCache {
 
         lock.lock()
         entries[path] = CachedFileScan(size: size, mtime: mtime, inode: inode,
-                                       sidecarSignature: nil, buckets: [],
+                                       sidecarSignature: storedSignature, buckets: [],
                                        tailBuckets: nil, position: nil, codexState: nil,
                                        events: fresh)
         dirty = true
@@ -481,7 +520,10 @@ final class ScanCache {
                    baseline: CodexUsageVec? = nil,
                    compute: (ResumePoint) -> ResumedBuckets?) -> ResumableOutcome {
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: path) else {
-            return ResumableOutcome(buckets: [], state: nil)
+            lock.lock(); defer { lock.unlock() }
+            guard let entry = entries[path] else { return ResumableOutcome(buckets: [], state: nil) }
+            return ResumableOutcome(buckets: mergeBuckets(entry.buckets + (entry.tailBuckets ?? [])),
+                                    state: entry.codexState)
         }
         let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
         let mtime = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
@@ -565,12 +607,10 @@ final class ScanCache {
         return (length, FNV1a.hash(window))
     }
 
-    /// Drop entries for files that no longer exist, then persist.
+    /// Persist the observed ledger, including disappeared logs. Clearing this
+    /// cache intentionally reparses available files but preserves missing ones.
     func save(knownPaths: Set<String>) {
         lock.lock()
-        let before = entries.count
-        entries = entries.filter { knownPaths.contains($0.key) }
-        if entries.count != before { dirty = true }
         guard dirty else {
             lock.unlock()
             return
@@ -588,7 +628,7 @@ final class ScanCache {
 
     func clear() {
         lock.lock()
-        entries = [:]
+        entries = entries.filter { !FileManager.default.fileExists(atPath: $0.key) }
         dirty = true
         lock.unlock()
     }

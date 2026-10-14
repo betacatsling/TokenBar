@@ -44,6 +44,9 @@ extension CLIKind {
         case .codex:      return Color(hex: dark ? 0x3987e5 : 0x2a78d6)
         case .devin:      return Color(hex: 0x008300)
         case .pi:         return Color(hex: dark ? 0xd55181 : 0xe87ba4)
+        case .gemini:     return Color(hex: dark ? 0x8c83e6 : 0x7663c4)
+        case .opencode:   return Color(hex: dark ? 0x40b6b0 : 0x167b79)
+        case .magpie:     return Color(hex: dark ? 0xa8a8a8 : 0x646464)
         }
     }
 
@@ -57,6 +60,9 @@ extension CLIKind {
         case .codex: return "Codex"
         case .devin: return "Devin"
         case .pi: return "pi"
+        case .gemini: return "Gemini"
+        case .opencode: return "OpenCode"
+        case .magpie: return "网关"
         }
     }
 }

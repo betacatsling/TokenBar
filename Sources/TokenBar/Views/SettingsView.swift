@@ -13,6 +13,7 @@ struct SettingsView: View {
     /// rescan with an SSH attempt, and a pause halfway through typing is not a host.
     @State private var hostDraft: String
     @FocusState private var hostFocused: Bool
+    @State private var billingFileError: String?
 
     init(settings: Settings, model: AppModel) {
         self.settings = settings
@@ -24,6 +25,7 @@ struct SettingsView: View {
     private static let rowPadding = EdgeInsets(top: 7, leading: 10, bottom: 7, trailing: 10)
 
     var body: some View {
+        ScrollView {
         VStack(alignment: .leading, spacing: 14) {
             Text("设置")
                 .font(.system(size: 13, weight: .semibold))
@@ -54,8 +56,8 @@ struct SettingsView: View {
             section("数据") {
                 HStack(spacing: 8) {
                     VStack(alignment: .leading, spacing: 2) {
-                        rowTitle("清空缓存并重扫")
-                        rowDetail(model.isScanning ? "正在扫描…" : "从头解析全部日志，较慢")
+                        rowTitle("重新解析日志")
+                        rowDetail(model.isScanning ? "正在扫描…" : "保留消失日志的历史用量")
                     }
                     Spacer(minLength: 8)
                     Button("重扫") {
@@ -67,6 +69,53 @@ struct SettingsView: View {
                     .disabled(model.isScanning)
                 }
                 .padding(Self.rowPadding)
+                rowDivider
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        rowTitle("订阅与实际账单")
+                        rowDetail("导入订阅、API 和额外工具费用")
+                    }
+                    Spacer()
+                    Button("打开文件") {
+                        do {
+                            try BillingLedger.createIfMissing()
+                            NSWorkspace.shared.open(BillingLedger.url)
+                            billingFileError = nil
+                        } catch { billingFileError = "无法创建账单文件" }
+                    }.controlSize(.small)
+                }.padding(Self.rowPadding)
+                rowDivider
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        rowTitle("供应商价格")
+                        rowDetail("按供应商和生效日期补充费率")
+                    }
+                    Spacer()
+                    Button("打开文件") {
+                        let url = BillingLedger.url.deletingLastPathComponent().appendingPathComponent("pricing-overrides.json")
+                        do {
+                            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                            if !FileManager.default.fileExists(atPath: url.path) {
+                                try Data("[]\n".utf8).write(to: url, options: .atomic)
+                            }
+                            NSWorkspace.shared.open(url)
+                            billingFileError = nil
+                        } catch { billingFileError = "无法打开供应商价格文件" }
+                    }.controlSize(.small)
+                }.padding(Self.rowPadding)
+            }
+
+            section("统计范围") {
+                Text("已接入 Claude、Codex、Devin、pi、Gemini、OpenCode 和可确认的网关调用。")
+                    .font(.system(size: 10)).foregroundStyle(.secondary).padding(Self.rowPadding)
+                ForEach(model.snapshot.coverage.issues, id: \.self) { issue in
+                    Text(issue).font(.system(size: 10)).foregroundStyle(.secondary).padding(Self.rowPadding)
+                }
+                Text("网页、云端及其他机器的用量尚未自动采集。计价比例仅针对已采集量。")
+                    .font(.system(size: 10)).foregroundStyle(.secondary).padding(Self.rowPadding)
+                if let billingFileError {
+                    Text(billingFileError).font(.system(size: 10)).foregroundStyle(Theme.serious).padding(Self.rowPadding)
+                }
             }
 
             Text("数据均为只读扫描，不会修改任何 CLI 的日志。")
@@ -75,7 +124,8 @@ struct SettingsView: View {
                 .padding(.leading, 4)
         }
         .padding(Theme.inset)
-        .frame(width: 300)
+        }
+        .frame(width: 300, height: 620)
         .onDisappear(perform: commitHost)
     }
 

@@ -21,8 +21,8 @@ length in the collector it belongs to:
     gate on the lineage peak, charge `min(last, cumulative advance)`, treat
     `last == 0` rows as watermark-only, and tell counter restarts
     (`last == total` on a drop) from stale regressions. A forked rollout
-    replays its parent's history, so its watermarks start at the parent's
-    historical maximum. `sessions/` and `archived_sessions/` hold the same
+    replays its parent's history, matched by recorded event identity rather
+    than the parent's later maximum. `sessions/` and `archived_sessions/` hold the same
     rollouts, deduplicated by file name.
   * Devin's `message_nodes` is a DAG that re-materialises each message once
     per following turn, so rows are de-duplicated by `request_id` (falling
@@ -41,6 +41,7 @@ import re
 import sqlite3
 import sys
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 HOME = os.path.expanduser("~")
 
@@ -122,22 +123,27 @@ def walk_jsonl(root):
     return glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True)
 
 
-def emit(buckets):
+def emit(buckets, diagnostics=None):
     """Merge and write the envelope."""
     merged = {}
     for b in buckets:
-        key = (b["cli"], b["model"], b["day"], b["sidechain"])
+        key = (b["cli"], b["model"], b["day"], b["sidechain"]) + tuple(
+            b.get(field) for field in (
+                "provider", "costSource", "pricingTier", "serviceTier", "speed", "inferenceGeo"))
         if key not in merged:
             merged[key] = b
         else:
-            for field in ("input", "output", "cacheRead", "cacheWrite"):
-                merged[key][field] += b[field]
+            for field in ("input", "output", "cacheRead", "cacheWrite", "cacheWrite1h"):
+                merged[key][field] = merged[key].get(field, 0) + b.get(field, 0)
+            if b.get("reportedCostUSD") is not None:
+                merged[key]["reportedCostUSD"] = (merged[key].get("reportedCostUSD") or 0) + b["reportedCostUSD"]
     rows = list(merged.values())
     json.dump(
         {
             "version": 1,
             "host": os.uname()[1],
             "buckets": rows,
+            "diagnostics": list(diagnostics or ()),
         },
         sys.stdout,
     )
@@ -161,6 +167,44 @@ def is_workflow_journal(path):
             break
         component = parent
     return False
+
+
+def apply_usage_metadata(bucket, *sources):
+    """Mirror UsageEventRecord.applyMetadata using only transcript metadata.
+
+    All reported amounts here are informational client estimates in USD.
+    """
+    sources = [source for source in sources if isinstance(source, dict)]
+
+    def string(*keys):
+        for source in sources:
+            for key in keys:
+                value = source.get(key)
+                if isinstance(value, str) and value:
+                    return value
+        return None
+
+    fields = {
+        "provider": string("provider", "providerId", "provider_id"),
+        "pricingTier": string("pricingTier", "pricing_tier"),
+        "serviceTier": string("serviceTier", "service_tier"),
+        "speed": string("speed"),
+        "inferenceGeo": string("inferenceGeo", "inference_geo"),
+        "costSource": string("costSource", "cost_source"),
+    }
+    if fields["pricingTier"] is None and "[1m]" in bucket["model"].lower():
+        fields["pricingTier"] = "long-context"
+    bucket.update({key: value for key, value in fields.items() if value is not None})
+    currency = string("currency", "costCurrency", "cost_currency")
+    if currency is not None and currency.upper() != "USD":
+        return bucket
+    for source in sources:
+        value = source.get("reportedCostUSD", source.get("costUSD", source.get("cost_usd")))
+        if isinstance(value, (int, float)) and 0 <= value < float("inf"):
+            bucket["reportedCostUSD"] = float(value)
+            bucket["costSource"] = "client-reported-estimate"
+            break
+    return bucket
 
 
 def collect_claude(root):
@@ -193,11 +237,19 @@ def collect_claude(root):
             if not isinstance(usage, dict):
                 continue
 
+            creation = usage.get("cache_creation")
+            if not isinstance(creation, dict):
+                creation = {}
+            write1h = as_int(creation.get("ephemeral_1h_input_tokens",
+                                         usage.get("cache_creation_1h_input_tokens")))
             counts = (
                 as_int(usage.get("input_tokens")),
                 as_int(usage.get("output_tokens")),
                 as_int(usage.get("cache_read_input_tokens")),
-                as_int(usage.get("cache_creation_input_tokens")),
+                (as_int(creation.get("ephemeral_5m_input_tokens"))
+                 if "ephemeral_5m_input_tokens" in creation
+                 else max(0, as_int(usage.get("cache_creation_input_tokens")) - write1h)),
+                write1h,
             )
             if sum(counts) <= 0:
                 continue
@@ -227,14 +279,20 @@ def collect_claude(root):
                 key = "uuid:%s" % (uuid if isinstance(uuid, str)
                                    else "anon-%d" % next(anon))
 
+            metadata = apply_usage_metadata({"model": model}, usage, message, obj)
+            metadata.pop("model")
             entry = best.get(key)
             if entry is None:
-                best[key] = [slot, counts]
+                best[key] = [slot, counts, metadata]
             else:
                 entry[1] = tuple(max(a, b) for a, b in zip(entry[1], counts))
+                reported = metadata.pop("reportedCostUSD", None)
+                entry[2].update(metadata)
+                if reported is not None:
+                    entry[2]["reportedCostUSD"] = max(entry[2].get("reportedCostUSD", 0), reported)
 
     out = []
-    for slot, counts in best.values():
+    for slot, counts, metadata in best.values():
         model, day, sidechain = slot
         out.append(
             {
@@ -245,7 +303,9 @@ def collect_claude(root):
                 "output": counts[1],
                 "cacheRead": counts[2],
                 "cacheWrite": counts[3],
+                "cacheWrite1h": counts[4],
                 "sidechain": sidechain,
+                **metadata,
             }
         )
     return out
@@ -317,6 +377,8 @@ def vec_bounded(v, cap):
     component regressed while another advanced; the cumulative scalar is the
     honest bound, so excess is cut from input first (the largest, least
     precise bucket) then output."""
+    v = vec_clamped(v)
+    cap = max(0, cap)
     if vec_total(v) <= cap:
         return v
     i, c, o, r = v
@@ -376,8 +438,8 @@ def codex_advance(state, total, last):
         if vec_total(last) <= advance:
             delta = last
         else:
-            delta = vec_bounded(vec_sub(total, state["peak"]), advance)
-        delta = vec_clamped(delta)
+            delta = vec_bounded(vec_clamped(vec_sub(total, state["peak"])), advance)
+        delta = vec_bounded(vec_clamped(delta), advance)
         state["peak_total"] = vec_total(total)
         state["peak"] = vec_max(state["peak"], total)
         return delta if vec_total(delta) > 0 else None
@@ -439,8 +501,7 @@ def probe_meta(path):
 
 def rollout_files(roots):
     """`rollout-*.jsonl` under both roots, deduplicated by basename and sorted
-    by basename so a parent is always processed before its forks (filenames
-    embed an ISO timestamp, so lexical order is birth order)."""
+    by basename for stable output. Parent lookup does not depend on order."""
     best = {}  # name -> (mtime, size, is_archived, path)
     for index, root in enumerate(roots):
         for path in walk_jsonl(root):
@@ -467,27 +528,72 @@ def rollout_files(roots):
     return [best[name][3] for name in sorted(best)]
 
 
+def codex_legacy_identity(obj, total, last):
+    timestamp = obj.get("timestamp")
+    if not isinstance(timestamp, str) or not timestamp:
+        return None
+    payload = obj.get("payload", {})
+    info = payload.get("info", {})
+    response = str_field(payload, "response_id") or str_field(info, "response_id") or ""
+    return (timestamp, total, last, response)
+
+
+def codex_event_time(obj):
+    try:
+        return datetime.fromisoformat(obj["timestamp"].replace("Z", "+00:00")).timestamp()
+    except (KeyError, ValueError, TypeError, AttributeError):
+        return None
+
+
 def collect_codex(roots):
     """Codex rollouts, as a lineage over cumulative `total_token_usage` snapshots.
 
-    Whole files are parsed in filename order so a parent is reduced before any
-    fork that might inherit its watermark.
+    Parent identities are indexed before accounting, independently of file order.
     """
     out = []
-    # session id -> that rollout's historical max cumulative. A fork looks its
-    # parent up here to start its watermarks past the replayed history.
-    session_final = {}
-
-    for path in rollout_files(roots):
+    # Session id -> recorded event identities, including copied ancestors.
+    paths = rollout_files(roots)
+    histories = {}
+    # Identity index precedes accounting, so parents may sort after children.
+    for path in paths:
         meta = probe_meta(path)
-        # A fork should start from the parent's historical max — unless it is a
-        # subagent thread: subagent usage is not part of the parent's
-        # accounting, so subtracting it would zero the whole file.
-        baseline = None
+        if not meta or not meta["own_id"]:
+            continue
+        identities = histories.setdefault(meta["own_id"], set())
+        for line in read_lines(path):
+            if '"token_count"' not in line and '"token_usage_record"' not in line:
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            payload = obj.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if obj.get("type") == "token_usage_record":
+                response = payload.get("response_id")
+                if isinstance(response, str) and response:
+                    identities.add(("response", response))
+            elif payload.get("type") == "token_count":
+                info = payload.get("info")
+                if isinstance(info, dict):
+                    response = str_field(payload, "response_id") or str_field(info, "response_id")
+                    if response:
+                        identities.add(("response", response))
+                    total = usage_vec(info.get("total_token_usage"))
+                    identity = codex_legacy_identity(obj, total, usage_vec(info.get("last_token_usage")))
+                    if identity is not None:
+                        identities.add(identity)
+
+    for path in paths:
+        meta = probe_meta(path)
+        # Match inherited history. An independent subagent counter has no
+        # legacy fork boundary to subtract.
+        replay = set()
         if meta is not None and not meta["is_subagent"] and meta["forked_from"]:
-            final = session_final.get(meta["forked_from"])
-            if final is not None and vec_total(final) > 0:
-                baseline = final
+            replay = histories.get(meta["forked_from"], set())
 
         state = {
             "model": "",
@@ -498,23 +604,28 @@ def collect_codex(roots):
             "peak_total": 0,
             "prev_total": None,
             "max_total": ZERO_VEC,
+            "modern_response_ids": set(),
+            "legacy_response_ids": set(),
+            "pending_modern_usage": None,
+            "pending_modern_timestamp": None,
+            "pending_modern_response_id": None,
+            "legacy_identities": set(),
+            "provider": None, "pricingTier": None, "serviceTier": None,
+            "speed": None, "inferenceGeo": None,
         }
-        if baseline is not None:
-            # Prime the watermarks at the parent's historical maximum; events
-            # at or below it are the replayed parent history and charge nothing.
-            state["peak"] = baseline
-            state["peak_total"] = vec_total(baseline)
-            state["max_total"] = baseline
 
         acc = {}
         for line in read_lines(path):
             if ('"token_count"' not in line
+                    and '"token_usage_record"' not in line
                     and '"turn_context"' not in line
                     and '"session_meta"' not in line):
                 continue
             try:
                 obj = json.loads(line)
             except ValueError:
+                continue
+            if not isinstance(obj, dict):
                 continue
             payload = obj.get("payload")
             if not isinstance(payload, dict):
@@ -532,31 +643,90 @@ def collect_codex(roots):
                 sm = session_meta(payload)
                 state["session_id"] = sm["own_id"]
                 state["is_subagent"] = sm["is_subagent"]
+                for target, keys in (("provider", ("model_provider", "provider")),
+                                     ("pricingTier", ("pricing_tier", "pricingTier")),
+                                     ("serviceTier", ("service_tier", "serviceTier")),
+                                     ("speed", ("speed",)),
+                                     ("inferenceGeo", ("inference_geo", "inferenceGeo"))):
+                    state[target] = str_field(payload, *keys) or state[target]
                 continue
 
             if kind == "turn_context":
+                state["pending_modern_usage"] = None
+                state["pending_modern_timestamp"] = None
+                state["pending_modern_response_id"] = None
                 m = payload.get("model")
                 if isinstance(m, str) and m:
                     state["model"] = m
+                state["serviceTier"] = None
+                state["speed"] = None
+                for target, keys in (("provider", ("model_provider", "provider")),
+                                     ("pricingTier", ("pricing_tier", "pricingTier")),
+                                     ("serviceTier", ("service_tier", "serviceTier")),
+                                     ("speed", ("speed",)),
+                                     ("inferenceGeo", ("inference_geo", "inferenceGeo"))):
+                    state[target] = str_field(payload, *keys) or state[target]
                 continue
 
-            if payload.get("type") != "token_count":
-                continue
-            info = payload.get("info")
-            if not isinstance(info, dict):
-                continue
-
-            total = usage_vec(info.get("total_token_usage"))
-            last = usage_vec(info.get("last_token_usage"))
-            if total is None:
-                if last is None or vec_total(last) <= 0:
+            if kind == "token_usage_record":
+                thread = payload.get("thread_id")
+                info = payload
+                usage = usage_vec(payload.get("usage"))
+                response_id = payload.get("response_id")
+                if (usage is None or vec_total(usage) <= 0
+                        or not isinstance(response_id, str) or not response_id):
                     continue
-                # Rows without a cumulative (legacy/foreign writers) synthesize
-                # one from the running peak so the normal lineage path handles
-                # them.
-                total = vec_add(state["peak"], last)
-
-            delta = codex_advance(state, total, last)
+                if response_id in state["modern_response_ids"]:
+                    continue
+                state["modern_response_ids"].add(response_id)
+                state["pending_modern_usage"] = usage
+                state["pending_modern_timestamp"] = codex_event_time(obj)
+                state["pending_modern_response_id"] = response_id
+                if response_id in state["legacy_response_ids"]:
+                    continue
+                if (("response", response_id) in replay
+                        or (isinstance(thread, str) and state["session_id"]
+                            and thread != state["session_id"])):
+                    continue
+                delta = vec_clamped(usage)
+            else:
+                if payload.get("type") != "token_count":
+                    continue
+                info = payload.get("info")
+                if not isinstance(info, dict):
+                    continue
+                total = usage_vec(info.get("total_token_usage"))
+                last = usage_vec(info.get("last_token_usage"))
+                if total is None:
+                    if last is None or vec_total(last) <= 0:
+                        continue
+                    total = vec_add(state["peak"], last)
+                response = payload.get("response_id", info.get("response_id"))
+                if isinstance(response, str) and response:
+                    if response in state["legacy_response_ids"]:
+                        continue
+                    state["legacy_response_ids"].add(response)
+                identity = codex_legacy_identity(obj, usage_vec(info.get("total_token_usage")), last)
+                if identity is not None:
+                    if identity in state["legacy_identities"]:
+                        continue
+                    state["legacy_identities"].add(identity)
+                delta = codex_advance(state, total, last)
+                if isinstance(response, str) and response in state["modern_response_ids"]:
+                    continue
+                if isinstance(response, str) and ("response", response) in replay:
+                    continue
+                now, then = codex_event_time(obj), state["pending_modern_timestamp"]
+                correlated = (response == state["pending_modern_response_id"] if response is not None
+                              else now is not None and then is not None and 0 <= now - then <= 2)
+                if (state["pending_modern_usage"] is not None
+                        and last == state["pending_modern_usage"] and correlated):
+                    state["pending_modern_usage"] = None
+                    continue
+                if last is not None and vec_total(last) > 0:
+                    state["pending_modern_usage"] = None
+                if identity is not None and identity in replay:
+                    continue
             if delta is None:
                 continue
 
@@ -582,13 +752,23 @@ def collect_codex(roots):
             # `is_subagent` steers only the fork-baseline decision, not the
             # sidechain flag (see the Swift collector).
             day = local_day(obj.get("timestamp")) or today()
-            key = (model, day)
+            metadata = []
+            for target, keys in (("provider", ("model_provider", "provider")),
+                                 ("pricingTier", ("pricing_tier", "pricingTier")),
+                                 ("serviceTier", ("service_tier", "serviceTier")),
+                                 ("speed", ("speed",)),
+                                 ("inferenceGeo", ("inference_geo", "inferenceGeo"))):
+                nested = payload.get("usage") if target == "serviceTier" else None
+                metadata.append(str_field(payload, *keys) or str_field(info, *keys)
+                                or (str_field(nested, *keys) if isinstance(nested, dict) else None)
+                                or state[target])
+            key = (model, day, *metadata)
             if key in acc:
                 acc[key] = tuple(a + b for a, b in zip(acc[key], counts))
             else:
                 acc[key] = counts
 
-        for (model, day), counts in acc.items():
+        for (model, day, provider, pricing_tier, service_tier, speed, inference_geo), counts in acc.items():
             out.append(
                 {
                     "cli": "codex",
@@ -599,15 +779,11 @@ def collect_codex(roots):
                     "cacheRead": counts[2],
                     "cacheWrite": counts[3],
                     "sidechain": False,
+                    "provider": provider, "pricingTier": pricing_tier,
+                    "serviceTier": service_tier, "speed": speed, "inferenceGeo": inference_geo,
                 }
             )
 
-        sid = state["session_id"]
-        if sid:
-            existing = session_final.get(sid)
-            session_final[sid] = (vec_max(existing, state["max_total"])
-                                  if existing is not None
-                                  else state["max_total"])
     return out
 
 
@@ -637,12 +813,13 @@ def collect_pi(root):
     counts alone — two distinct calls can cost the same tokens.
     """
     seen = set()
-    acc = {}
+    out = []
     # Sorted so the winner of a duplicated rid is deterministic. First
     # occurrence wins; measured copies carry byte-identical usage, so the
     # choice only fixes which timestamp family the day comes from.
     for path in sorted(walk_jsonl(os.path.join(root, "sessions"))):
         session_model = None
+        session_provider = None
         for line in read_lines(path):
             if '"usage"' in line:
                 try:
@@ -657,18 +834,15 @@ def collect_pi(root):
                     as_int(usage.get("input")),
                     as_int(usage.get("output")),
                     as_int(usage.get("cacheRead")),
-                    # `cacheWrite1h` is the extended-TTL tier, billed separately
-                    # but still cache-creation tokens.
-                    as_int(usage.get("cacheWrite"))
-                    + as_int(usage.get("cacheWrite1h")),
+                    as_int(usage.get("cacheWrite")),
+                    as_int(usage.get("cacheWrite1h")),
                 )
                 if sum(counts) <= 0:
                     continue
                 # `responseModel` is what the gateway actually served; `model`
                 # is only what was requested, and pi's proxies substitute
                 # freely.
-                model = str_field(message, "responseModel", "modelId",
-                                  "model", "provider")
+                model = str_field(message, "responseModel", "modelId", "model")
                 if model is None:
                     model = session_model or "unknown"
                 day = local_day(obj.get("timestamp")) or today()
@@ -689,11 +863,20 @@ def collect_pi(root):
                     continue
                 seen.add(rid)
 
-                key = (model, day)
-                if key in acc:
-                    acc[key] = tuple(a + b for a, b in zip(acc[key], counts))
-                else:
-                    acc[key] = counts
+                bucket = dict(zip(("input", "output", "cacheRead", "cacheWrite", "cacheWrite1h"), counts))
+                bucket.update(cli="pi", model=model, day=day, sidechain=False)
+                apply_usage_metadata(bucket, message, usage, obj)
+                if bucket.get("provider") is None and session_provider is not None:
+                    bucket["provider"] = session_provider
+                cost = usage.get("cost")
+                if isinstance(cost, dict):
+                    total = cost.get("total")
+                    currencies = [source.get("currency") for source in (cost, usage, message, obj)]
+                    if (isinstance(total, (int, float)) and 0 < total < float("inf")
+                            and all(value.upper() == "USD" for value in currencies if isinstance(value, str))):
+                        bucket["reportedCostUSD"] = float(total)
+                        bucket["costSource"] = "client-reported-estimate"
+                out.append(bucket)
             elif '"model_change"' in line:
                 # model_change carries the model for the whole session.
                 try:
@@ -703,21 +886,7 @@ def collect_pi(root):
                 m = obj.get("modelId")
                 if isinstance(m, str) and m:
                     session_model = m
-
-    out = []
-    for (model, day), counts in acc.items():
-        out.append(
-            {
-                "cli": "pi",
-                "model": model,
-                "day": day,
-                "input": counts[0],
-                "output": counts[1],
-                "cacheRead": counts[2],
-                "cacheWrite": counts[3],
-                "sidechain": False,
-            }
-        )
+                    session_provider = obj.get("provider") if isinstance(obj.get("provider"), str) else None
     return out
 
 
@@ -744,7 +913,7 @@ def collect_devin(db_path):
         return []
     out = []
     try:
-        conn = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True)
+        conn = sqlite3.connect("file:%s?mode=ro" % quote(os.path.abspath(db_path), safe="/"), uri=True)
     except sqlite3.Error:
         return []
     try:
@@ -753,7 +922,6 @@ def collect_devin(db_path):
             "FROM message_nodes m JOIN sessions s ON s.id = m.session_id "
             "ORDER BY m.row_id"
         )
-        acc = {}
         seen = set()
         for session_model, chat_message, created_at, session_id in cursor:
             if not chat_message:
@@ -779,14 +947,15 @@ def collect_devin(db_path):
                     as_int(metrics.get("output_tokens")),
                     as_int(metrics.get("cache_read_tokens")),
                     as_int(metrics.get("cache_creation_tokens")),
+                    as_int(metrics.get("cache_creation_1h_tokens")),
                 )
             else:
-                counts = (0, 0, 0, 0)
+                counts = (0, 0, 0, 0, 0)
             # Some schemas report `num_tokens` when no metrics block is
             # written; fold it into output rather than dropping the row.
             num_tokens = as_int(metadata.get("num_tokens"))
             if sum(counts) <= 0 and num_tokens > 0:
-                counts = (0, num_tokens, 0, 0)
+                counts = (0, num_tokens, 0, 0, 0)
             if sum(counts) <= 0:
                 continue
 
@@ -819,30 +988,218 @@ def collect_devin(db_path):
             # time of a later turn (median +80 min locally, up to 24.7 h).
             day = (local_day(metadata.get("created_at"))
                    or day_from_unix(created_at))
-            key = (served, day)
-            if key in acc:
-                acc[key] = tuple(a + b for a, b in zip(acc[key], counts))
-            else:
-                acc[key] = counts
-
-        for (model, day), counts in acc.items():
-            out.append(
-                {
-                    "cli": "devin",
-                    "model": model,
-                    "day": day,
-                    "input": counts[0],
-                    "output": counts[1],
-                    "cacheRead": counts[2],
-                    "cacheWrite": counts[3],
-                    "sidechain": False,
-                }
-            )
+            bucket = dict(zip(("input", "output", "cacheRead", "cacheWrite", "cacheWrite1h"), counts))
+            bucket.update(cli="devin", model=served, day=day, sidechain=False)
+            apply_usage_metadata(bucket, metrics, metadata)
+            out.append(bucket)
     except sqlite3.Error:
         pass
     finally:
         conn.close()
     return out
+
+
+# ---------------------------------------------------------------------------
+# Additional sources. Never open provider/auth configuration files.
+# ---------------------------------------------------------------------------
+
+def additional_bucket(cli, model, day, counts, provider=None, cost=None):
+    bucket = dict(zip(("input", "output", "cacheRead", "cacheWrite", "cacheWrite1h"), counts))
+    bucket.update(cli=cli, model=model, day=day, sidechain=False,
+                  provider=provider, reportedCostUSD=cost,
+                  costSource="reported" if cost is not None else None,
+                  pricingTier=None, serviceTier=None, speed=None, inferenceGeo=None)
+    return bucket
+
+
+def additional_dedup(events):
+    """Message IDs survive file copies and OpenCode's JSON -> SQLite migration."""
+    best = {}
+    for identity, bucket in events:
+        if identity not in best:
+            best[identity] = bucket
+            continue
+        previous = best[identity]
+        for field in ("input", "output", "cacheRead", "cacheWrite", "cacheWrite1h"):
+            previous[field] = max(previous.get(field, 0), bucket.get(field, 0))
+        if bucket.get("reportedCostUSD") is not None:
+            previous["reportedCostUSD"] = max(previous.get("reportedCostUSD") or 0, bucket["reportedCostUSD"])
+            previous["costSource"] = bucket["costSource"]
+    return list(best.values())
+
+
+def collect_gemini(root):
+    import uuid
+    events = []
+    for path in sorted(glob.glob(os.path.join(root, "tmp", "*", "chats", "session-*.json"))):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                obj = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(obj, dict) or not isinstance(obj.get("messages"), list):
+            continue
+        session = obj.get("sessionId") or os.path.basename(path)
+        for index, message in enumerate(obj["messages"]):
+            if not isinstance(message, dict) or message.get("type") != "gemini":
+                continue
+            usage = message.get("tokens")
+            day = local_day(message.get("timestamp"))
+            if not isinstance(usage, dict) or not day:
+                continue
+            total_input = max(0, as_int(usage.get("input")))
+            read = min(total_input, max(0, as_int(usage.get("cached"))))
+            counts = (total_input - read, max(0, as_int(usage.get("output")))
+                      + max(0, as_int(usage.get("thoughts"))), read, 0, 0)
+            if sum(counts) <= 0:
+                continue
+            identity = message.get("id")
+            if isinstance(identity, str) and identity:
+                try:
+                    uuid.UUID(identity)
+                    identity = "gemini:" + identity
+                except ValueError:
+                    identity = "gemini:%s:%s" % (session, identity)
+            else:
+                identity = "gemini:%s:%s:%s" % (session, index, message.get("timestamp"))
+            events.append((identity, additional_bucket("gemini", message.get("model") or "unknown", day, counts, "google")))
+    return additional_dedup(events)
+
+
+def opencode_event(obj, fallback_id=None):
+    import math
+    if not isinstance(obj, dict) or obj.get("role") != "assistant":
+        return None
+    usage, stamp = obj.get("tokens"), obj.get("time")
+    identity = obj.get("id") or fallback_id
+    if not isinstance(usage, dict) or not isinstance(stamp, dict) or not identity:
+        return None
+    created = stamp.get("created")
+    if not isinstance(created, (int, float)) or not math.isfinite(created) or created <= 0:
+        return None
+    model_obj = obj.get("model") if isinstance(obj.get("model"), dict) else {}
+    model = obj.get("modelID") or model_obj.get("modelID") or "unknown"
+    provider = obj.get("providerID") or model_obj.get("providerID")
+    cache = usage.get("cache") if isinstance(usage.get("cache"), dict) else {}
+    input_count = max(0, as_int(usage.get("input")))
+    read, write, one_hour = (max(0, as_int(cache.get(k))) for k in ("read", "write", "write1h"))
+    output = max(0, as_int(usage.get("output")))
+    total = as_int(usage.get("total"))
+    if total > 0:
+        output = max(0, total - input_count - read - write - one_hour)
+    elif "openai" not in (provider or "").lower():
+        output += max(0, as_int(usage.get("reasoning")))
+    counts = (input_count, output, read, write, one_hour)
+    if sum(counts) <= 0:
+        return None
+    cost = obj.get("cost")
+    if (not isinstance(cost, (int, float)) or isinstance(cost, bool) or not math.isfinite(cost)
+            or cost < 0 or (cost == 0 and not model.lower().endswith(("-free", ":free")))):
+        cost = None
+    return ("opencode:" + str(identity), additional_bucket(
+        "opencode", model, day_from_unix(created / 1000.0), counts, provider, cost))
+
+
+def collect_opencode(root):
+    events = []
+    path = os.path.join(root, "opencode.db")
+    if os.path.isfile(path):
+        conn = None
+        try:
+            conn = sqlite3.connect("file:%s?mode=ro" % quote(os.path.abspath(path), safe="/"), uri=True)
+            for identity, raw in conn.execute("SELECT id, data FROM message ORDER BY id"):
+                try:
+                    event = opencode_event(json.loads(raw), identity)
+                except (ValueError, TypeError):
+                    continue
+                if event:
+                    events.append(event)
+        except sqlite3.Error:
+            pass
+        finally:
+            if conn is not None:
+                conn.close()
+    for path in sorted(glob.glob(os.path.join(root, "storage", "message", "**", "*.json"), recursive=True)):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                event = opencode_event(json.load(handle), os.path.splitext(os.path.basename(path))[0])
+        except (OSError, ValueError):
+            continue
+        if event:
+            events.append(event)
+    return additional_dedup(events)
+
+
+def collect_magpie(root, excluding=None, diagnostics=None):
+    """Only the documented agent=magpie own classifier calls are standalone.
+    Exact full-record fingerprints collapse gateway append copies, never used
+    to join across CLI sources. `req` is a model route, NOT a request ID.
+    `excluding` accepts raw request/response IDs and r:/request:/response: forms.
+    """
+    excluding = set(excluding or ())
+    events = []
+    stats = {"ambiguous": 0, "joined": 0, "malformed": 0, "duplicates": 0, "standalone": 0}
+    seen = set()
+    for line in read_lines(os.path.join(root, "usage.jsonl")):
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            stats["malformed"] += 1
+            continue
+        if not isinstance(obj, dict):
+            stats["malformed"] += 1
+            continue
+        ids = [obj[k] for k in ("response_id", "responseId", "request_id", "requestId")
+               if isinstance(obj.get(k), str) and obj[k]]
+        if any(identity in excluding or any(prefix + identity in excluding
+               for prefix in ("r:", "request:", "response:", "magpie:")) for identity in ids):
+            stats["joined"] += 1
+            continue
+        day = local_day(obj.get("t"))
+        model = obj.get("served") or obj.get("model")
+        agent = str(obj.get("agent") or "").lower()
+        provider = obj.get("provider")
+        if agent != "magpie" or not day or not isinstance(model, str) or not model or not isinstance(provider, str) or not provider:
+            stats["ambiguous"] += 1
+            continue
+        import hashlib
+        fingerprint = "fingerprint:" + hashlib.sha256(json.dumps(
+            obj, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+        identity = ids[0] if ids else fingerprint
+        if identity in seen:
+            stats["duplicates"] += 1
+            continue
+        seen.add(identity)
+        counts = tuple(max(0, as_int(obj.get(k))) for k in ("in", "out", "cache_read", "cache_write", "cache_write_1h"))
+        if sum(counts) > 0:
+            events.append(("magpie:" + identity, additional_bucket("magpie", model, day, counts, provider)))
+            stats["standalone"] += 1
+    if diagnostics is not None:
+        diagnostics.update(stats)
+    if stats["ambiguous"] or stats["joined"]:
+        print("Magpie: excluded %d ambiguous or CLI gateway mirrors; %d joined mirrors" %
+              (stats["ambiguous"], stats["joined"]), file=sys.stderr)
+    return additional_dedup(events)
+
+
+def missing_codex_rollouts(codex_home):
+    """Count indexed logs no longer present, without modifying the state DB.
+    Return only a count; never expose indexed paths or other thread metadata.
+    """
+    path = os.path.join(codex_home, "state_5.sqlite")
+    if not os.path.isfile(path):
+        return 0
+    conn = None
+    try:
+        conn = sqlite3.connect("file:%s?mode=ro" % quote(os.path.abspath(path), safe="/"), uri=True)
+        paths = [row[0] for row in conn.execute("SELECT rollout_path FROM threads")
+                 if isinstance(row[0], str) and row[0]]
+        return sum(1 for path in paths if not os.path.isfile(path))
+    except sqlite3.Error:
+        return 0
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def main():
@@ -853,6 +1210,8 @@ def main():
         or os.path.join(HOME, ".pi", "agent")
     xdg_data = os.environ.get("XDG_DATA_HOME") \
         or os.path.join(HOME, ".local", "share")
+    gemini_home = os.environ.get("GEMINI_CLI_HOME") or os.path.join(HOME, ".gemini")
+    magpie_config = os.environ.get("MAGPIE_CONFIG_DIR") or os.path.join(HOME, ".config", "magpie")
 
     buckets = []
     buckets += collect_claude(os.path.join(claude_config, "projects"))
@@ -866,7 +1225,19 @@ def main():
     buckets += collect_devin(
         os.path.join(xdg_data, "devin", "cli", "sessions.db")
     )
-    emit(buckets)
+    buckets += collect_gemini(gemini_home)
+    buckets += collect_opencode(os.path.join(xdg_data, "opencode"))
+    magpie_stats = {}
+    buckets += collect_magpie(magpie_config, diagnostics=magpie_stats)
+    diagnostics = []
+    missing = missing_codex_rollouts(codex_home)
+    if missing:
+        diagnostics.append("Codex 有 %d 个历史会话缺少日志，历史总量不完整" % missing)
+    if magpie_stats.get("ambiguous"):
+        diagnostics.append("Magpie 已排除 %d 条无法安全独立计入的网关镜像记录" % magpie_stats["ambiguous"])
+    if magpie_stats.get("malformed"):
+        diagnostics.append("Magpie 有 %d 条无法解析的用量记录，未计入" % magpie_stats["malformed"])
+    emit(buckets, diagnostics=diagnostics)
 
 
 if __name__ == "__main__":

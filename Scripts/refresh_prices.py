@@ -22,6 +22,7 @@ here and Pricing.swift can divide by a round number.
 """
 import argparse
 import json
+import math
 import os
 import sys
 import urllib.request
@@ -51,9 +52,7 @@ def convert(raw):
     out = raw.get("output_cost_per_token")
     # An entry pricing only one direction would under-report silently, which is
     # worse than reporting the model as unpriced. Both or nothing.
-    if not isinstance(inp, (int, float)) or not isinstance(out, (int, float)):
-        return None
-    if inp <= 0 and out <= 0:
+    if not numeric(inp) or not numeric(out):
         return None
 
     entry = {"i": round(inp * PER_MILLION, 6), "o": round(out * PER_MILLION, 6)}
@@ -64,11 +63,45 @@ def convert(raw):
     # deepseek-v4-flash-vision-exp, this machine's largest pi model.)
     read = raw.get("cache_read_input_token_cost")
     write = raw.get("cache_creation_input_token_cost")
-    if isinstance(read, (int, float)) and read >= 0:
+    if numeric(read):
         entry["r"] = round(read * PER_MILLION, 6)
-    if isinstance(write, (int, float)) and write >= 0:
+    if numeric(write):
         entry["w"] = round(write * PER_MILLION, 6)
+    write1h = raw.get("cache_creation_input_token_cost_above_1hr")
+    if numeric(write1h):
+        entry["w1h"] = round(write1h * PER_MILLION, 6)
+    variants = []
+    # Explicit tiers only: bucket totals cannot reconstruct a call's context.
+    for context in ["", "_above_200k_tokens", "_above_272k_tokens"]:
+        for service in ["", "_batches", "_flex", "_priority", "_ultrafast"]:
+            suffix = context + service
+            if not suffix:
+                continue
+            i = raw.get("input_cost_per_token" + suffix)
+            o = raw.get("output_cost_per_token" + suffix)
+            if not numeric(i) or not numeric(o):
+                continue
+            variant = {"i": round(i * PER_MILLION, 6), "o": round(o * PER_MILLION, 6)}
+            if context:
+                variant["pricingTier"] = "long-context" if context == "_above_200k_tokens" else "above-272k"
+            if service == "_ultrafast":
+                variant["speed"] = "ultrafast"
+            elif service:
+                variant["serviceTier"] = "batch" if service == "_batches" else service[1:]
+            for compact, upstream in [("r", "cache_read_input_token_cost"),
+                                      ("w", "cache_creation_input_token_cost"),
+                                      ("w1h", "cache_creation_input_token_cost_above_1hr")]:
+                value = raw.get(upstream + suffix)
+                if numeric(value):
+                    variant[compact] = round(value * PER_MILLION, 6)
+            variants.append(variant)
+    if variants:
+        entry["v"] = variants
     return entry
+
+
+def numeric(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
 
 
 def build(raw):

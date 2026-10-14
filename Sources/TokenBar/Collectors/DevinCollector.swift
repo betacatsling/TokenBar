@@ -105,7 +105,8 @@ struct DevinCollector: Collector {
     }
 
     func collect(cache: ScanCache) -> [UsageBucket] {
-        guard FileManager.default.fileExists(atPath: dbPath) else { return [] }
+        guard FileManager.default.fileExists(atPath: dbPath)
+                || cache.retainedPaths(under: (dbPath as NSString).deletingLastPathComponent).contains(dbPath) else { return [] }
         // The DB runs in WAL mode, so committed rows live in `-wal` until a
         // checkpoint folds them into the main file. Keying freshness on the `.db`
         // alone therefore serves stale totals — measured here as rows changing
@@ -144,9 +145,11 @@ struct DevinCollector: Collector {
     static func scan(dbPath: String, origin: Origin) -> [UsageBucket] {
         var db: OpaquePointer?
         // Read-only + immutable-safe: the CLI may hold the write lock.
-        let uri = "file:\(dbPath)?mode=ro"
+        var components = URLComponents(url: URL(fileURLWithPath: dbPath), resolvingAgainstBaseURL: false)!
+        components.queryItems = [URLQueryItem(name: "mode", value: "ro")]
+        let uri = components.string!
         guard sqlite3_open_v2(uri, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil) == SQLITE_OK,
-              let db else { return [] }
+              let db else { if let db { sqlite3_close(db) }; return [] }
         defer { sqlite3_close(db) }
 
         let sql = """
@@ -159,7 +162,7 @@ struct DevinCollector: Collector {
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return [] }
         defer { sqlite3_finalize(stmt) }
 
-        var acc: [BucketKey: TokenCounts] = [:]
+        var buckets: [UsageBucket] = []
         // Keyed by (session, message_id): the same assistant message is stored
         // once per subsequent turn, so only its first appearance is counted.
         var seen = Set<String>()
@@ -185,7 +188,8 @@ struct DevinCollector: Collector {
                     input: intValue(metrics?["input_tokens"]),
                     output: intValue(metrics?["output_tokens"]),
                     cacheRead: intValue(metrics?["cache_read_tokens"]),
-                    cacheWrite: intValue(metrics?["cache_creation_tokens"])
+                    cacheWrite: intValue(metrics?["cache_creation_tokens"]),
+                    cacheWrite1h: intValue(metrics?["cache_creation_1h_tokens"])
                 )
                 // Some schemas report `num_tokens` when no metrics block is
                 // written; fold it into output rather than dropping the row.
@@ -220,15 +224,14 @@ struct DevinCollector: Collector {
                     .flatMap { DayFormatter.day(fromISO: $0) }
                     ?? DayFormatter.day(fromUnixSeconds: sqlite3_column_double(stmt, 2))
 
-                let key = BucketKey(origin: origin, cli: .devin, model: model, day: day, isSidechain: false)
-                acc[key, default: .zero] += counts
+                var event = UsageEventRecord(rid: requestID ?? messageID ?? UUID().uuidString,
+                                             model: model, day: day, tokens: counts)
+                event.applyMetadata([metrics ?? [:], metadata])
+                buckets.append(event.bucket(origin: origin, cli: .devin))
             }
         }
 
-        return acc.map { key, tokens in
-            UsageBucket(origin: key.origin, cli: key.cli, model: key.model,
-                        day: key.day, tokens: tokens, isSidechain: key.isSidechain)
-        }
+        return mergeBuckets(buckets)
     }
 
     private static func columnText(_ stmt: OpaquePointer, _ index: Int32) -> String? {

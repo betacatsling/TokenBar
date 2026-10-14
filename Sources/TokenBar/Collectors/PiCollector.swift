@@ -44,22 +44,25 @@ struct PiCollector: Collector {
 
     func collect(cache: ScanCache) -> [UsageBucket] {
         var seen = Set<String>()
-        var acc: [BucketKey: TokenCounts] = [:]
+        var buckets: [UsageBucket] = []
         // Sorted so the winner of a duplicated rid is deterministic. First
         // occurrence wins; measured copies carry byte-identical usage, so the
         // choice only fixes which timestamp family the day comes from.
-        for path in discoverPaths().sorted() {
+        let sessions = root + "/sessions"
+        let canonical = sessions.withCString { pointer -> String in
+            guard let path = realpath(pointer, nil) else { return sessions }
+            defer { free(path) }
+            return String(cString: path)
+        }
+        let retained = cache.retainedPaths(under: sessions)
+            + cache.retainedPaths(under: canonical)
+        for path in Set(discoverPaths() + retained).sorted() {
             for ev in cache.events(for: path, compute: { Self.scanEvents(path: path) }) {
                 guard seen.insert(ev.rid).inserted else { continue }
-                let key = BucketKey(origin: origin, cli: .pi, model: ev.model,
-                                    day: ev.day, isSidechain: ev.isSidechain)
-                acc[key, default: .zero] += ev.tokens
+                buckets.append(ev.bucket(origin: origin, cli: .pi))
             }
         }
-        return acc.map { key, tokens in
-            UsageBucket(origin: key.origin, cli: key.cli, model: key.model,
-                        day: key.day, tokens: tokens, isSidechain: key.isSidechain)
-        }
+        return mergeBuckets(buckets)
     }
 
     /// One file's usage-bearing rows, at per-record granularity so the
@@ -67,6 +70,7 @@ struct PiCollector: Collector {
     static func scanEvents(path: String) -> [UsageEventRecord] {
         var events: [UsageEventRecord] = []
         var sessionModel: String?
+        var sessionProvider: String?
 
         LineReader.forEachLine(path: path) { line in
             // Drain per line; see ClaudeCodeCollector for why this matters to RSS.
@@ -82,10 +86,8 @@ struct PiCollector: Collector {
                         input: intValue(usage["input"]),
                         output: intValue(usage["output"]),
                         cacheRead: intValue(usage["cacheRead"]),
-                        // `cacheWrite1h` is the extended-TTL tier, billed
-                        // separately but still cache-creation tokens. Rare here
-                        // (1 event) yet free to fold in.
-                        cacheWrite: intValue(usage["cacheWrite"]) + intValue(usage["cacheWrite1h"])
+                        cacheWrite: intValue(usage["cacheWrite"]),
+                        cacheWrite1h: intValue(usage["cacheWrite1h"])
                     )
                     guard counts.total > 0 else { return }
 
@@ -99,7 +101,6 @@ struct PiCollector: Collector {
                     let model = (message["responseModel"] as? String)
                         ?? (message["modelId"] as? String)
                         ?? (message["model"] as? String)
-                        ?? (message["provider"] as? String)
                         ?? sessionModel
                         ?? "unknown"
                     let tsStr = obj["timestamp"] as? String ?? ""
@@ -110,7 +111,7 @@ struct PiCollector: Collector {
                     // but is only 8 hex chars, so it keeps the usage signature
                     // as a collision guard. Timestamp is deliberately excluded
                     // from the entry-id fallback — measured copies re-stamp it.
-                    let sig = "\(counts.input)/\(counts.output)/\(counts.cacheRead)/\(counts.cacheWrite)"
+                    let sig = "\(counts.input)/\(counts.output)/\(counts.cacheRead)/\(counts.cacheWrite)/\(counts.cacheWrite1h)"
                     let rid: String
                     if let r = message["responseId"] as? String, !r.isEmpty {
                         rid = "r:\(r)"
@@ -120,12 +121,22 @@ struct PiCollector: Collector {
                         rid = "s:\(model):\(tsStr):\(sig)"
                     }
 
-                    events.append(UsageEventRecord(rid: rid, model: model, day: day,
-                                                   isSidechain: false, tokens: counts))
+                    var event = UsageEventRecord(rid: rid, model: model, day: day, tokens: counts)
+                    event.applyMetadata([message, usage, obj])
+                    event.provider = event.provider ?? sessionProvider
+                    if let cost = usage["cost"] as? [String: Any],
+                       let total = cost["total"] as? NSNumber, total.doubleValue.isFinite, total.doubleValue > 0,
+                       [cost["currency"], usage["currency"], message["currency"], obj["currency"]]
+                        .compactMap({ $0 as? String }).allSatisfy({ $0.uppercased() == "USD" }) {
+                        event.reportedCostUSD = total.doubleValue
+                        event.costSource = "client-reported-estimate"
+                    }
+                    events.append(event)
                 } else if line.containsBytes(Array("\"model_change\"".utf8)),
                           let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
                           let m = obj["modelId"] as? String, !m.isEmpty {
                     sessionModel = m
+                    sessionProvider = obj["provider"] as? String
                 }
             }
         }

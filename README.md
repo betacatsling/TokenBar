@@ -1,83 +1,104 @@
 # TokenBar
 
-macOS 菜单栏 Token 统计工具。点击菜单栏图标弹出面板，一屏看清**本机**和 **server1** 上各个 AI CLI 的 token 消耗与费用估算。
+macOS 菜单栏用量工具，汇总本机和配置的 SSH 主机的 AI 用量。保留按 CLI、模型、机器查看与每日趋势。
 
-支持 4 个 CLI：**Claude Code**、**Codex CLI**、**Devin CLI**、**pi**。
+支持 **Claude Code、Codex、Devin、pi、Gemini CLI、OpenCode、Magpie**。只读采集原始日志和数据库，不采集 API 密钥。
 
 ## 快速开始
 
 ```bash
-./Scripts/build_app.sh     # 构建
-open dist/TokenBar.app     # 启动（菜单栏出现图标）
+./Scripts/build_app.sh
+open dist/TokenBar.app
 ```
 
-首次启动会全量扫描一次（约 15 秒，因为 Codex 日志有 2.7 GB），之后走增量缓存，刷新在 0.6 秒内。
+## 统计与费用
 
-## 面板说明
+- Token 分为普通输入、输出、缓存读取、5 分钟缓存写入、1 小时缓存写入；推理 token 按各来源的语义处理，避免重复相加。
+- **估算费用**按模型、提供商、缓存期限和日志中已有的计费档位计算；没有可验证费率时显示未计价。计价覆盖率仅针对已采集用量。
+- **日志记录费用**单独显示。pi 等客户端记录的费用可能只是客户端估算，既不替代真实账单，也不叠加到牌价估算。
+- **已导入账单**单独显示，支持订阅、网关实际扣款、工具服务费、退款等。按账单发生日期筛选，不和 token 估算相加。
+- Magpie 中 CLI 转发镜像不再次加入；仅明确标记为 Magpie 自身调用的记录纳入。来源不明记录在设置中提示。
+- 已采集的本机日志消失后保留历史，重新解析仍存在的日志时保留这些记录。缓存升级会重扫可用原始日志。
+- 远端汇总按主机保存，离线或应用重启时仍可查看上次结果；成功刷新以远端现有日志为准，目前不能恢复远端已删除且未保存的历史。
 
-```
-┌────────────────────────────────────────┐
-│ [ 今日 | 7 天 | 30 天 | 全部 ]         │  ← 时间范围，作用于下面所有内容
-│                                        │
-│ 今日用量                      估算费用 │
-│ 153.9M tokens                   ≈ $133 │  ← 总量 + 费用估算
-│ 153,860,915  82% 已计价 · 46% 估算费率 │  ← 精确值 + 计价覆盖率
-│                                        │
-│ 近 14 天                   日均 103.0M │
-│ ▂ ▂ ▃ ▁ ▁ ▁ ▂ ▁ ▂ ▁ ▁ █ █ ▄            │  ← 每天按 CLI 堆叠，悬停看当天明细
-│ 9/13                              今天 │     浅色底带 = 当前时间范围覆盖的天
-│ ● Claude  ● Codex  ● Devin  ● pi       │
-├────────────────────────────────────────┤
-│ [ 按 CLI | 按模型 | 按机器 ]           │  ← 三种视角
-│ ● Devin CLI 46%      71.3M  $34.05+~ › │  ← 颜色与趋势图一致，点击展开模型
-│   ████████████                         │     + = 部分无公开价，~ = 推算费率
-│ ● pi 45%             69.5M  $73.65+  › │
-│   ███████████                          │
-│ ● Claude Code 5%      7.7M  无公开价 › │  ← 没有价格就说没有，不写 $0
-│   █                                    │
-├────────────────────────────────────────┤
-│ 更新于 刚刚 · 含 server1       ⟳  ⚙  ⏻ │  ← 状态；刷新 / 设置 / 退出
-└────────────────────────────────────────┘
-```
-
-- **三个标签页**：`按 CLI`（点击行展开该 CLI 的模型明细）、`按模型`（全部模型跨 CLI 合并，按用量排序）、`按机器`（本机 vs server1）。百分比是占当前时间范围总量的份额。
-- **每个 CLI 的颜色固定**，趋势图、图例、列表圆点和占比条用的是同一个颜色；这组颜色在浅色和深色外观下都跑过色盲安全校验。
-- **⟳** 走增量缓存刷新（本机部分约 0.5 秒），并强制重新拉取一次 server1；要从头全量重扫，去 **⚙** 里点「清空缓存并重扫」。
-- **⚙** 里还可以关闭 server1 统计、修改主机名、切换是否计入子代理、调整自动刷新间隔。
-- server1 连不上时，面板上会出现一条带图标的提示，说明显示的是上次结果还是本次未统计。
-- 菜单栏显示今日用量（可在设置里关掉，关掉后只显示图标）。
-
-## 关于费用估算
-
-费用一律带 `≈` 前缀，**这是估算而非账单**：它算的是按公开牌价这些请求*本该*花多少，而订阅制和折扣网关的实际账单并非如此。
-
-价格表分三层合并，越靠后优先级越高：
-
-1. `Resources/model_prices.json`——LiteLLM 价目表的精简快照（4,147 个模型，含 990 个无歧义的裸名别名），也是 `ccusage` 用的同一张表。内置而非联网拉取：本工具要能离线工作，且同样的输入要给出同样的答案。用 `Scripts/refresh_prices.py` 更新。
-2. `~/.pi/agent/models-store.json`——用户网关里配置的真实价格。`glm-5.3`、`kimi-k3`、`qwen3.8-max` 只有这一个来源，公开表里完全没有。
-3. 内置的第一方价格，防止外部表的错误条目影响主要模型。
-
-**没有价格就明说没有，而不是记 0**。如果显示 `$0`，几千万 token 看起来就像免费的；面板上这类模型标「无公开价」，只计价了一部分的行标 `+` 表示这是下限。目前 95% 的 token 有价格。
-
-**推算来的费率单独标 `~`**。Devin 的 `swe-2` 没有任何公开定价，但它是由 kimi-k3 后训练而来，所以按 kimi-k3 的费率（3 / 15 / 0.3 / 0）估算。这个费率有两个独立来源相互印证：`~/.pi/agent/models-store.json` 里 `kimi-k3` 在两个 provider 下都是这个数，LiteLLM 的 `moonshot/kimi-k3` 也是 3 / 15 / 0.3。
-
-推算和公开价在 UI 上**不混为一谈**：这类行标 `~`，总计卡片写「2% 估算费率」。这个数字只说明「这些 token 按 kimi-k3 的价算是多少」，不多不少——swe-2 真实怎么计费仍然是未知的。代码里写死而不是运行时去查 `kimi-k3`：链式查找会让 pi 的 store 一被改动就悄悄改变 swe-2 的费用。
-
-Devin 的 `compactor`（上下文压缩模型）没有列入推算——它和任何已定价模型都没有公开的关系，所以保持「无公开价」，占 Devin 本机 token 的 0.06%。
-
-查找是**精确匹配**（小写化、去掉 `[1m]` 之类的变体后缀、再试 `provider/` 前缀之后的裸名）。曾经用的最长前缀匹配有 bug：`gpt-5` 会匹配上 `gpt-5.6-sol`，按错误的代次计价。
+设置中显示已知采集缺口。Codex 索引里的累计计数不是可安全相加的调用记录，不能用它补齐已删除的 rollout。Cursor、Antigravity、网页聊天及其他未接入机器的 token 仍不自动计入。
 
 ## 数据来源
 
-全部**只读**扫描，不修改任何 CLI 的日志。
-
-| CLI | 路径 | 解析方式 |
+| 来源 | 默认路径 | 处理方式 |
 |---|---|---|
-| Claude Code | `~/.claude/projects/**/*.jsonl` | 按 `message.id` 取最大值去重 |
-| Codex CLI | `~/.codex/sessions/` + `archived_sessions/` | 全量解析每回合增量，可断点续扫 |
-| Devin CLI | `~/.local/share/devin/cli/sessions.db` | SQLite 只读 URI，按 `message_id` 去重，模型取 `generation_model`，按天用 `metadata.created_at` |
-| pi | `~/.pi/agent/sessions/*/*.jsonl` | 直接累加 |
-| server1 | 同上（远端） | SSH 远端聚合 |
+| Claude Code | `~/.claude/projects/**/*.jsonl` | 按消息与请求身份合并流式快照，跨文件去重，区分缓存期限 |
+| Codex | `~/.codex/sessions/`、`archived_sessions/` | 新旧事件、累计重置、父会话重放、断点续扫 |
+| Devin | `~/.local/share/devin/cli/sessions.db` | SQLite 只读，按请求去重，读取生成模型和真实生成时间 |
+| pi | `~/.pi/agent/sessions/**/*.jsonl` | 跨文件响应去重，保留实际模型、提供商和日志费用 |
+| Gemini CLI | `~/.gemini/tmp/*/chats/session-*.json` | 缓存输入不重复加入，输出加独立 thoughts |
+| OpenCode | `~/.local/share/opencode/opencode.db`、旧版消息 JSON | 只读数据库与 WAL 更新，按消息身份去重 |
+| Magpie | `~/.config/magpie/usage.jsonl` | 自身调用计入，CLI 镜像排除 |
+| SSH 主机 | 同上 | 远端聚合，按本机时区归日，仅回传汇总 |
+
+支持现有 `CLAUDE_CONFIG_DIR`、`CODEX_HOME`、`PI_CODING_AGENT_DIR`、`XDG_DATA_HOME`、`GEMINI_CLI_HOME`、`MAGPIE_CONFIG_DIR` 路径设置。
+
+## 价格与账单配置
+
+公开价来自随应用打包的 `model_prices.json`；内置价格只补缺，不覆盖已有目录。`~/.pi/agent/models-store.json` 的网关费率按提供商匹配，避免同名模型跨网关串价。没有明确来源的模型继续标为未计价，不虚构价格。`swe-2` 的历史代理费率仍标为估算。
+
+设置中“供应商价格”和“订阅与实际账单”的“打开文件”分别打开以下文件；首次打开创建空数组，不填入虚构金额：
+
+- `~/Library/Application Support/TokenBar/pricing-overrides.json`
+- `~/Library/Application Support/TokenBar/billing.json`
+
+自定义费率每百万 token 计价，日期边界包含当天。以下只是格式示例，费率须替换为自己的合同值：
+
+```json
+[
+  {
+    "model": "your-model",
+    "provider": "your-provider",
+    "effectiveFrom": "2026-10-01",
+    "currency": "USD",
+    "price": {"input": 1, "output": 2, "cacheRead": 0.1, "cacheWrite": 1.25, "cacheWrite1h": 2}
+  }
+]
+```
+
+可选限定字段还有 `effectiveUntil`、`pricingTier`、`serviceTier`、`speed`、`inferenceGeo`。未提供 1 小时缓存价格时，这部分不能被当作免费。无效日期、负费率和非 USD 价格会提示。重叠规则优先匹配供应商限定、生效日期较新的规则，再取文件中靠后的规则。
+
+账单每条需要唯一编号；可录入订阅、按量收费、服务费，退款用负数。示例金额仅演示格式：
+
+```json
+[
+  {"id": "invoice-example", "date": "2026-10-01", "provider": "your-provider", "label": "订阅或实际扣款", "usd": 20}
+]
+```
+
+文件保存后刷新应用。重复账单编号或无效日期会导致文件不计入，并显示原因。暂只支持美元；导入账单不代表自动对账。
+
+## 验证
+
+```bash
+swift build -c release
+python3 Scripts/test_codex_collection.py
+python3 Scripts/test_additional_collection.py
+python3 Scripts/test_pricing.py
+.build/release/TokenBar --test-ledger
+.build/release/TokenBar --test-resume
+.build/release/TokenBar --test-wal-cache
+.build/release/TokenBar --verify --models
+python3 Scripts/verify.py --models
+```
+
+Python 校验复用生产远端采集器，固定预期的测试另外验证正确性。正在写入的日志会使两次扫描结果不同；比较应使用固定日志。诊断和测试不会启动应用的后台扫描。
+
+```bash
+dist/tokenbar --render /tmp/tokenbar.png --range all
+dist/tokenbar --render /tmp/tokenbar-settings.png --settings
+```
+
+渲染使用独立设置，不修改正常应用偏好。要求 macOS 13+、Swift 5.9+；远端采集使用已有 SSH 配置。
+
+## 历史排错记录
+
+以下数据来自早期日志快照，数量、性能与覆盖率不能代表当前完整度；采集行为以以上说明和现有回归测试为准。
 
 ### 八个格式陷阱
 
@@ -96,7 +117,7 @@ Devin 的 `compactor`（上下文压缩模型）没有列入推算——它和�
    - **fork 会话被重复计算**：fork / 子代理的 rollout 开头会把父会话的**全部历史抄一遍**，每行都重新打上 fork 时刻的时间戳，所以它末尾的累计值把父会话的 token 也算了进去——而父会话自己的文件已经算过一次。本机 21 个 fork 文件里这部分是 **929,578,493 token，占它们内容的 76.9%**。
    - **压缩会重置计数器**：会话超出上下文窗口后 `total_token_usage` 会从接近 0 重新开始。文件 `rollout-2026-09-05T12-43-18-01a06fe0` 跨 3 天、重置了 2 次（84,966,808 → 80,949，36,574,329 → 212,639），尾部读数只有 26.2M，实际消耗 148.9M——**单文件少算 82%**。376 个非 fork 文件里有 14 个发生过重置。
 
-   现在改为累加每回合的 `last_token_usage` 增量，丢弃连续重复，并按 **1 秒间隔**（`ccusage` 用的同一阈值）抑制开头那串抄来的记录。两个独立检验支持这个量是对的：**376 个非 fork 文件里有 362 个**增量之和与文件末尾累计值完全相等；而且增量自带时间戳，于是用量落在**真正发生的那天**（145 个自然日），而不是全压在会话最后活跃的那天。
+   当时改为累加每回合增量并使用时间间隔抑制重放。当前实现进一步改为按父会话事件身份识别重放，避免父会话继续增长后误扣 fork 的新增用量。两个独立检验支持这个量是对的：**376 个非 fork 文件里有 362 个**增量之和与文件末尾累计值完全相等；而且增量自带时间戳，于是用量落在**真正发生的那天**（145 个自然日），而不是全压在会话最后活跃的那天。
    代价是要读 2.70 GB 而非几 MB。靠字节级预筛 + 断点续扫把它压了回来：冷扫 13.2 s，增量刷新 **0.03 s**。
 
 4. **Devin 的 `message_nodes` 是 DAG 不是日志，必须按 `message_id` 去重。**
@@ -160,7 +181,7 @@ Devin 的 `compactor`（上下文压缩模型）没有列入推算——它和�
 
 ### pi 的四个字段语义（实测，56 个文件 / 726 条 usage）
 
-pi 是四个里最干净的，但结论是验证出来的而不是假设的：726 条 id 全不重复（不需要去重）；`totalTokens` 与 `input+output+cacheRead+cacheWrite` **726 条全部相等**（所以分项互不重叠，直接相加即可）；`reasoning` 是 `output` 的子集（9,849 vs 512,913，从不超出），所以**不另计**；`usage.cost` 恒为 0，没有厂商上报的费用可用。
+以下是早期 56 文件快照，当前 pi 已需要跨文件去重，且部分日志带有非零费用：726 条 id 全不重复（不需要去重）；`totalTokens` 与 `input+output+cacheRead+cacheWrite` **726 条全部相等**（所以分项互不重叠，直接相加即可）；`reasoning` 是 `output` 的子集（9,849 vs 512,913，从不超出），所以**不另计**；`usage.cost` 恒为 0，没有厂商上报的费用可用。
 
 唯一的坑是模型归属：要用 `responseModel`（网关实际服务的模型）而不是 `model`（请求的模型）。实测 **120 条请求 `x-preview-f-free` 实际由 `ox-alpha-free` 服务**，占 pi 用量的 10.5%。按请求名归属会按错误的模型计价，并且把这种替换完全掩盖掉。
 
@@ -182,106 +203,3 @@ Codex 的 rollout 在 App 运行期间还在被追加写入，所以刷新时只
 修法：`ScanCache` 的所有可变状态用 `NSLock` 保护（解析放在锁外，避免长扫描阻塞读取）；
 `AppModel` 增加 `autoScan` 参数，harness 传 `false` 从根上避免重叠；
 `RemoteCollector.status` 是同一类问题（扫描线程写、主线程读），一并加锁。
-
-
-## 验证
-
-两套独立实现交叉比对——Swift 采集器与 `Scripts/verify.py` 分开编写（Python 那份是照着磁盘格式重写的，不是从 Swift 翻译过来的，否则同样的错会犯两遍），两者一致才有意义。两边输出同样的 `key: value` 行，可直接 diff。
-
-```bash
-dist/tokenbar --verify           # Swift 实现，冷扫描
-dist/tokenbar --verify --warm    # 走缓存，测增量性能
-dist/tokenbar --verify --models  # 加上逐模型总量
-python3 Scripts/verify.py --models   # 独立的 Python 参照实现
-```
-
-实测结果（本机，2026-09-16，两轮背靠背运行）：
-
-| 数据源 | Swift | Python 参照 |
-|---|---|---|
-| claude-code | 169,244,438 | 169,244,438 ✓ |
-| codex | 4,283,002,276 | 4,283,002,276 ✓ |
-| devin | 100,454,948 | 100,454,948 ✓ |
-| pi | 70,324,337 | 70,324,337 ✓ |
-| **合计** | **4,623,025,999** | **4,623,025,999 ✓** |
-
-逐键 diff：**45/45 个键完全一致**（4 个 `cli.*` + 14 个 `day.*` + **26 个 `model.*`** + `total_tokens`）。
-
-`model.*` 是后加的：模型归属在 `cli.*` 和 `day.*` 里完全看不出来，而归属恰恰是最容易错的地方（陷阱 8 那个 2.88 亿 token 的 `unknown` 就是归属错误，不是数量错误）。不把逐模型总量纳入 diff，这类 bug 就是交叉验证的盲区。
-
-第三份实现 `remote_collect.py` 对着本机数据跑，同样复现 devin 100,454,948（`swe-2` 100,393,421 / `compactor` 61,527）。
-
-Claude Code 的去重比率：朴素求和 313,435,468 vs 去重后 174,775,856 = **1.793×**（`--verify` 每次都会打出这三行；日志在持续写入，绝对值会变，比例稳定在 1.7～1.8）。
-
-> 这些数字在变动：本机的 Devin / Claude Code 正在持续写入。上表是某一瞬间的快照，逐字段一致才是有意义的信号。
-
-性能（2.7 GB Codex 日志 + 530 MB Claude 日志，release 构建）：
-
-| | 冷扫描 | 增量刷新 |
-|---|---|---|
-| Codex（2.70 GB） | 13.2 s | **0.03 s** |
-| 全部四个 CLI | 15.0 s | **0.53 s** |
-
-改成全量解析后冷扫描比原来的尾部读取慢（约 10 s → 15 s），这是换取正确性的代价；日常走的增量路径反而更快。
-
-其他验证开关：
-
-```bash
-dist/tokenbar --test-wal-cache                 # WAL 缓存键回归测试（见陷阱 6）
-dist/tokenbar --test-resume                    # 断点续扫回归测试
-dist/tokenbar --render out.png --range today   # 渲染面板为 PNG，便于检查布局
-dist/tokenbar --render out.png --tab model     # 渲染指定标签页
-dist/tokenbar --render out.png --dark          # 深色外观
-dist/tokenbar --render out.png --expand codex  # 展开某个 CLI 的模型明细
-dist/tokenbar --render out.png --settings      # 渲染设置面板
-dist/tokenbar --render out.png --host bogus    # 验证 server1 离线降级
-python3 Scripts/refresh_prices.py --dry-run    # 看价格表会怎么变，不写文件
-```
-
-`--render` 使用独立的 UserDefaults suite，不会污染真实配置。
-
-## server1 采集
-
-通过 SSH 把 `remote_collect.py` 从 stdin 喂给远端 `python3` 执行，**只回传聚合后的 JSON**（约 43 KB），不传 530 MB 原始日志。不在服务器上安装任何常驻服务。
-
-利用 `~/.ssh/config` 里已有的 `ControlMaster` 复用连接。远端结果缓存 10 分钟；SSH 不通时面板显示「server1 离线」并保留上次结果，不会卡死。
-
-## 项目结构
-
-```
-Sources/TokenBar/
-  TokenBarApp.swift          @main，MenuBarExtra
-  AppModel.swift             扫描调度与发布
-  Verify.swift               --verify / --render / --test-* 诊断
-  Core/
-    UsageRecord.swift        统一数据模型
-    Aggregator.swift         分组、区间过滤、快照
-    Pricing.swift            三层价格表与费用估算
-    ScanCache.swift          流式行读取 + 断点续扫缓存
-    Settings.swift           偏好设置
-    Formatting.swift         数字格式化
-  Collectors/                四个本地 + 一个远端
-  Views/                     面板（三个标签页）、设置、趋势图、配色与共享样式
-  Resources/
-    remote_collect.py        推送到 server1 执行
-    model_prices.json        LiteLLM 价目表快照
-Scripts/
-  build_app.sh               构建 .app
-  verify.py                  独立参照实现
-  devin_compare.py           Devin 去重前后对比 + request_id 证据
-  refresh_prices.py          更新价目表快照
-```
-
-## 环境要求
-
-- macOS 13+
-- Swift 5.9+（**只需 Command Line Tools，无需安装 Xcode**）
-- server1 统计需要 `~/.ssh/config` 中配好免密登录
-
-## 已知限制
-
-- **费用是估算。** 见上文；目前 95% 的 token 有公开价格。`swe-2` 按 kimi-k3 费率推算并标 `~`；其余（`gpt-reserve`、`gpt-5.3-codex-spark`、Devin 的 `compactor` 等）标注为「无公开价」而不是计 0。
-- **Devin 的每日归属依赖 `metadata.created_at`。** 这个字段目前 100% 存在；万一某天缺失，该行会退回行上的 `created_at`，那条记录就可能落在晚几小时的那一天（总量不受影响）。
-- **Codex 在一次回合内切换模型时，该回合归给切换后的模型。** 归属来自最近一条 `turn_context`，这是日志里能拿到的最细粒度。
-- **本机日志正在被实时写入**，所以两次运行的数字天然会有差异。判断实现是否正确要看两套独立实现的**逐字段一致性**，而不是某个绝对值。
-- `--verify` 默认冷扫描以得到可复现的数字；加 `--warm` 走缓存。

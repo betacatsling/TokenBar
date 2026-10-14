@@ -26,6 +26,9 @@ enum CLIKind: String, Codable, CaseIterable, Hashable {
     case codex
     case devin
     case pi
+    case gemini
+    case opencode
+    case magpie
 
     var displayName: String {
         switch self {
@@ -33,6 +36,9 @@ enum CLIKind: String, Codable, CaseIterable, Hashable {
         case .codex: return "Codex CLI"
         case .devin: return "Devin CLI"
         case .pi: return "pi"
+        case .gemini: return "Gemini CLI"
+        case .opencode: return "OpenCode"
+        case .magpie: return "Magpie"
         }
     }
 
@@ -43,6 +49,9 @@ enum CLIKind: String, Codable, CaseIterable, Hashable {
         case .codex: return 1
         case .devin: return 2
         case .pi: return 3
+        case .gemini: return 4
+        case .opencode: return 5
+        case .magpie: return 6
         }
     }
 }
@@ -53,10 +62,28 @@ struct TokenCounts: Codable, Hashable {
     var output: Int = 0
     var cacheRead: Int = 0
     var cacheWrite: Int = 0
+    var cacheWrite1h: Int = 0
+
+    enum CodingKeys: String, CodingKey { case input, output, cacheRead, cacheWrite, cacheWrite1h }
+
+    init(input: Int = 0, output: Int = 0, cacheRead: Int = 0,
+         cacheWrite: Int = 0, cacheWrite1h: Int = 0) {
+        self.input = input; self.output = output; self.cacheRead = cacheRead
+        self.cacheWrite = cacheWrite; self.cacheWrite1h = cacheWrite1h
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        input = try c.decodeIfPresent(Int.self, forKey: .input) ?? 0
+        output = try c.decodeIfPresent(Int.self, forKey: .output) ?? 0
+        cacheRead = try c.decodeIfPresent(Int.self, forKey: .cacheRead) ?? 0
+        cacheWrite = try c.decodeIfPresent(Int.self, forKey: .cacheWrite) ?? 0
+        cacheWrite1h = try c.decodeIfPresent(Int.self, forKey: .cacheWrite1h) ?? 0
+    }
 
     /// Billable + cached total. Cache reads are real tokens the model processed,
     /// so they count toward the headline number.
-    var total: Int { input + output + cacheRead + cacheWrite }
+    var total: Int { input + output + cacheRead + cacheWrite + cacheWrite1h }
 
     static let zero = TokenCounts()
 
@@ -64,7 +91,8 @@ struct TokenCounts: Codable, Hashable {
         TokenCounts(input: a.input + b.input,
                     output: a.output + b.output,
                     cacheRead: a.cacheRead + b.cacheRead,
-                    cacheWrite: a.cacheWrite + b.cacheWrite)
+                    cacheWrite: a.cacheWrite + b.cacheWrite,
+                    cacheWrite1h: a.cacheWrite1h + b.cacheWrite1h)
     }
 
     static func += (a: inout TokenCounts, b: TokenCounts) { a = a + b }
@@ -76,7 +104,8 @@ struct TokenCounts: Codable, Hashable {
         TokenCounts(input: Swift.max(input, other.input),
                     output: Swift.max(output, other.output),
                     cacheRead: Swift.max(cacheRead, other.cacheRead),
-                    cacheWrite: Swift.max(cacheWrite, other.cacheWrite))
+                    cacheWrite: Swift.max(cacheWrite, other.cacheWrite),
+                    cacheWrite1h: Swift.max(cacheWrite1h, other.cacheWrite1h))
     }
 }
 
@@ -98,6 +127,62 @@ struct UsageEventRecord: Codable, Hashable {
     var day: String
     var isSidechain: Bool = false
     var tokens: TokenCounts
+    var provider: String? = nil
+    var reportedCostUSD: Double? = nil
+    var costSource: String? = nil
+    var pricingTier: String? = nil
+    var serviceTier: String? = nil
+    var speed: String? = nil
+    var inferenceGeo: String? = nil
+
+    func bucket(origin: Origin, cli: CLIKind) -> UsageBucket {
+        UsageBucket(origin: origin, cli: cli, model: model, day: day, tokens: tokens,
+                    isSidechain: isSidechain, provider: provider, reportedCostUSD: reportedCostUSD,
+                    costSource: costSource, pricingTier: pricingTier, serviceTier: serviceTier,
+                    speed: speed, inferenceGeo: inferenceGeo)
+    }
+
+    func mergingSnapshot(with other: UsageEventRecord) -> UsageEventRecord {
+        var result = self
+        result.tokens = tokens.maxed(with: other.tokens)
+        result.provider = other.provider ?? provider
+        result.pricingTier = other.pricingTier ?? pricingTier
+        result.serviceTier = other.serviceTier ?? serviceTier
+        result.speed = other.speed ?? speed
+        result.inferenceGeo = other.inferenceGeo ?? inferenceGeo
+        result.costSource = other.costSource ?? costSource
+        if let cost = other.reportedCostUSD { result.reportedCostUSD = Swift.max(reportedCostUSD ?? 0, cost) }
+        return result
+    }
+
+    /// Reads only usage metadata, never configuration or credentials.
+    mutating func applyMetadata(_ sources: [[String: Any]]) {
+        func string(_ keys: [String]) -> String? {
+            for source in sources {
+                for key in keys {
+                    if let s = source[key] as? String, !s.isEmpty { return s }
+                }
+            }
+            return nil
+        }
+        provider = string(["provider", "providerId", "provider_id"])
+        pricingTier = string(["pricingTier", "pricing_tier"])
+            ?? (model.lowercased().contains("[1m]") ? "long-context" : nil)
+        serviceTier = string(["serviceTier", "service_tier"])
+        speed = string(["speed"])
+        inferenceGeo = string(["inferenceGeo", "inference_geo"])
+        costSource = string(["costSource", "cost_source"])
+        let currency = string(["currency", "costCurrency", "cost_currency"])
+        guard currency == nil || currency?.uppercased() == "USD" else { return }
+        for source in sources {
+            if let cost = (source["reportedCostUSD"] ?? source["costUSD"] ?? source["cost_usd"]) as? NSNumber,
+               cost.doubleValue.isFinite, cost.doubleValue >= 0 {
+                reportedCostUSD = cost.doubleValue
+                costSource = "client-reported-estimate"
+                break
+            }
+        }
+    }
 }
 
 /// One aggregated bucket: a (origin, cli, model, day) tuple with its tokens.
@@ -112,9 +197,18 @@ struct UsageBucket: Codable, Hashable {
     var tokens: TokenCounts
     /// Claude Code subagent (sidechain) traffic, tracked so the UI can exclude it.
     var isSidechain: Bool = false
+    var provider: String? = nil
+    var reportedCostUSD: Double? = nil
+    var costSource: String? = nil
+    var pricingTier: String? = nil
+    var serviceTier: String? = nil
+    var speed: String? = nil
+    var inferenceGeo: String? = nil
 
     var groupKey: BucketKey {
-        BucketKey(origin: origin, cli: cli, model: model, day: day, isSidechain: isSidechain)
+        BucketKey(origin: origin, cli: cli, model: model, day: day, isSidechain: isSidechain,
+                  provider: provider, pricingTier: pricingTier, serviceTier: serviceTier,
+                  speed: speed, inferenceGeo: inferenceGeo, costSource: costSource)
     }
 }
 
@@ -124,20 +218,31 @@ struct BucketKey: Codable, Hashable {
     var model: String
     var day: String
     var isSidechain: Bool
+    var provider: String? = nil
+    var pricingTier: String? = nil
+    var serviceTier: String? = nil
+    var speed: String? = nil
+    var inferenceGeo: String? = nil
+    var costSource: String? = nil
 }
 
 /// Merge buckets that share a key. Collectors and the remote decoder both feed
 /// through this so totals never depend on emission granularity.
 func mergeBuckets(_ buckets: [UsageBucket]) -> [UsageBucket] {
-    var acc: [BucketKey: TokenCounts] = [:]
+    var acc: [BucketKey: UsageBucket] = [:]
     acc.reserveCapacity(buckets.count)
     for b in buckets {
-        acc[b.groupKey, default: .zero] += b.tokens
+        if var existing = acc[b.groupKey] {
+            existing.tokens += b.tokens
+            if let reported = b.reportedCostUSD {
+                existing.reportedCostUSD = (existing.reportedCostUSD ?? 0) + reported
+            }
+            acc[b.groupKey] = existing
+        } else {
+            acc[b.groupKey] = b
+        }
     }
-    return acc.map { key, tokens in
-        UsageBucket(origin: key.origin, cli: key.cli, model: key.model,
-                    day: key.day, tokens: tokens, isSidechain: key.isSidechain)
-    }
+    return Array(acc.values)
 }
 
 // MARK: - Date helpers

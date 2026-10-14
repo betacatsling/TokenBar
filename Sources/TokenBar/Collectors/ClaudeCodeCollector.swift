@@ -62,30 +62,25 @@ struct ClaudeCodeCollector: Collector {
         // transcript still recovers the message's final usage, and copies are
         // byte-identical so the merge is a no-op for them.
         var best: [String: UsageEventRecord] = [:]
-        for path in discoverPaths().sorted() {
+        let canonical = root.withCString { pointer -> String in
+            guard let path = realpath(pointer, nil) else { return root }
+            defer { free(path) }
+            return String(cString: path)
+        }
+        let retained = cache.retainedPaths(under: root) + cache.retainedPaths(under: canonical)
+        for path in Set(discoverPaths() + retained).sorted() where !Self.isWorkflowJournal(path) {
             for ev in cache.events(for: path, compute: { Self.scanEvents(path: path) }) {
                 if let existing = best[ev.rid] {
                     // Keep the first record's slot (model/day/sidechain) —
                     // copies share it verbatim — but take the field-wise max
                     // of the counts.
-                    var merged = existing
-                    merged.tokens = existing.tokens.maxed(with: ev.tokens)
-                    best[ev.rid] = merged
+                    best[ev.rid] = existing.mergingSnapshot(with: ev)
                 } else {
                     best[ev.rid] = ev
                 }
             }
         }
-        var acc: [BucketKey: TokenCounts] = [:]
-        for ev in best.values {
-            let key = BucketKey(origin: origin, cli: .claudeCode, model: ev.model,
-                                day: ev.day, isSidechain: ev.isSidechain)
-            acc[key, default: .zero] += ev.tokens
-        }
-        return acc.map { key, tokens in
-            UsageBucket(origin: key.origin, cli: key.cli, model: key.model,
-                        day: key.day, tokens: tokens, isSidechain: key.isSidechain)
-        }
+        return mergeBuckets(best.values.map { $0.bucket(origin: origin, cli: .claudeCode) })
     }
 
     /// One file's usage-bearing rows at per-record granularity. Within the
@@ -109,11 +104,16 @@ struct ClaudeCodeCollector: Collector {
                       let usage = message["usage"] as? [String: Any]
                 else { return }
 
+                let creation = usage["cache_creation"] as? [String: Any]
+                let write1h = intValue(creation?["ephemeral_1h_input_tokens"] ?? usage["cache_creation_1h_input_tokens"])
                 let counts = TokenCounts(
                     input: intValue(usage["input_tokens"]),
                     output: intValue(usage["output_tokens"]),
                     cacheRead: intValue(usage["cache_read_input_tokens"]),
-                    cacheWrite: intValue(usage["cache_creation_input_tokens"])
+                    cacheWrite: creation?["ephemeral_5m_input_tokens"] != nil
+                        ? intValue(creation?["ephemeral_5m_input_tokens"])
+                        : max(0, intValue(usage["cache_creation_input_tokens"]) - write1h),
+                    cacheWrite1h: write1h
                 )
                 guard counts.total > 0 else { return }
 
@@ -138,14 +138,14 @@ struct ClaudeCodeCollector: Collector {
                     key = "uuid:\((obj["uuid"] as? String) ?? UUID().uuidString)"
                 }
 
+                var event = UsageEventRecord(rid: key, model: model, day: day,
+                                             isSidechain: sidechain, tokens: counts)
+                event.applyMetadata([usage, message, obj])
                 if let existing = best[key] {
-                    var merged = existing
-                    merged.tokens = existing.tokens.maxed(with: counts)
-                    best[key] = merged
+                    best[key] = existing.mergingSnapshot(with: event)
                 } else {
                     order.append(key)
-                    best[key] = UsageEventRecord(rid: key, model: model, day: day,
-                                                 isSidechain: sidechain, tokens: counts)
+                    best[key] = event
                 }
             }
         }

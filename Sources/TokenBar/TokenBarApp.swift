@@ -8,9 +8,13 @@ import AppKit
 /// the Dock or the app switcher.
 @main
 struct TokenBarApp: App {
-    @StateObject private var model = AppModel()
+    @StateObject private var model: AppModel
 
     init() {
+        if CommandLine.arguments.contains("--test-ledger") {
+            AccountingTests.run()
+            exit(0)
+        }
         // Diagnostics mode: scan, print a summary, exit. Used by the verification
         // harness to cross-check the Swift numbers against an independent pass.
         if CommandLine.arguments.contains("--verify") {
@@ -34,6 +38,7 @@ struct TokenBarApp: App {
             Verify.render(path: out)
             exit(0)
         }
+        _model = StateObject(wrappedValue: AppModel())
     }
 
     var body: some Scene {

@@ -113,7 +113,8 @@ final class AppModel: ObservableObject {
             includeSidechain: settings.includeSidechain,
             localBuckets: localBuckets,
             remoteBuckets: remoteBuckets,
-            duration: duration
+            duration: duration,
+            remoteEnabled: settings.remoteEnabled
         )
     }
 

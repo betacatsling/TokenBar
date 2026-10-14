@@ -31,6 +31,8 @@ final class RemoteCollector {
     private var lastFetch: Date?
     private var _status: RemoteStatus = .idle
     private let lock = NSLock()
+    private var _diagnostics: [String] = []
+    private var savedDate: Date?
 
     /// The host as currently configured.
     var host: String { lock.lock(); defer { lock.unlock() }; return _host }
@@ -39,10 +41,12 @@ final class RemoteCollector {
     /// Written on the scan thread, read on the main thread when the snapshot is
     /// rebuilt, so it is guarded like the rest of the mutable state here.
     var status: RemoteStatus { lock.lock(); defer { lock.unlock() }; return _status }
+    var diagnostics: [String] { lock.lock(); defer { lock.unlock() }; return _diagnostics }
 
     init(host: String = "server1", ttl: TimeInterval = 600) {
         self._host = host
         self._ttl = ttl
+        restoreSnapshot(host: host)
     }
 
     /// Apply changed settings. Discards the cached timestamp so the next fetch
@@ -54,6 +58,10 @@ final class RemoteCollector {
         if _host != host {
             _host = host
             lastFetch = nil
+            cachedBuckets = []
+            _diagnostics = []
+            savedDate = nil
+            restoreSnapshot(host: host)
         }
         _ttl = ttl
     }
@@ -67,7 +75,7 @@ final class RemoteCollector {
 
     var lastKnownDate: Date? {
         lock.lock(); defer { lock.unlock() }
-        return lastFetch
+        return lastFetch ?? savedDate
     }
 
     /// Returns fresh buckets, or the previous ones if the TTL has not elapsed or
@@ -87,16 +95,19 @@ final class RemoteCollector {
 
         lock.lock()
         _status = .fetching
+        let scanHost = _host
         lock.unlock()
 
-        let result = runRemote()
+        let result = runRemote(host: scanHost)
 
         lock.lock()
         defer { lock.unlock() }
+        guard _host == scanHost else { return cachedBuckets }
         switch result {
         case .success(let buckets):
             cachedBuckets = mergeBuckets(buckets)
             lastFetch = Date()
+            savedDate = lastFetch
             _status = .ok(Date())
             return cachedBuckets
         case .failure(let error):
@@ -117,7 +128,7 @@ final class RemoteCollector {
         }
     }
 
-    private func runRemote() -> Result<[UsageBucket], Error> {
+    private func runRemote(host: String) -> Result<[UsageBucket], Error> {
         guard let script = RemoteCollector.scriptURL,
               let scriptData = try? Data(contentsOf: script) else {
             return .failure(FetchError.scriptMissing)
@@ -130,7 +141,7 @@ final class RemoteCollector {
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=10",
             host,
-            "python3 -"
+            "env TZ=\(TimeZone.current.identifier) python3 -"
         ]
 
         let stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
@@ -161,10 +172,37 @@ final class RemoteCollector {
 
         do {
             let buckets = try RemotePayload.decode(outData)
+            let envelope = try JSONDecoder().decode(RemotePayload.Envelope.self, from: outData)
+            lock.lock()
+            if _host == host { _diagnostics = envelope.diagnostics ?? [] }
+            lock.unlock()
+            persistSnapshot(outData, host: host)
             return .success(buckets)
         } catch {
             return .failure(FetchError.failed("远端返回无法解析：\(error.localizedDescription)"))
         }
+    }
+
+    private static func snapshotURL(host: String) -> URL {
+        let name = Data(host.utf8).base64EncodedString().replacingOccurrences(of: "/", with: "_")
+        return ScanCache.defaultURL.deletingLastPathComponent()
+            .appendingPathComponent("remote-\(name).json")
+    }
+
+    private func persistSnapshot(_ data: Data, host: String) {
+        let url = Self.snapshotURL(host: host)
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? data.write(to: url, options: .atomic)
+    }
+
+    private func restoreSnapshot(host: String) {
+        let url = Self.snapshotURL(host: host)
+        guard let data = try? Data(contentsOf: url), let buckets = try? RemotePayload.decode(data) else { return }
+        cachedBuckets = buckets
+        _diagnostics = (try? JSONDecoder().decode(RemotePayload.Envelope.self, from: data).diagnostics) ?? []
+        lastFetch = nil // An offline snapshot must never bypass the first fetch.
+        savedDate = (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate]) as? Date
+        _status = .offline("已加载上次保存的汇总，等待刷新")
     }
 
     /// Locate the bundled script. See `BundledResource` for why this avoids
@@ -183,6 +221,7 @@ enum RemotePayload {
         var version: Int
         var host: String
         var buckets: [Row]
+        var diagnostics: [String]?
     }
 
     struct Row: Codable {
@@ -194,6 +233,14 @@ enum RemotePayload {
         var cacheRead: Int
         var cacheWrite: Int
         var sidechain: Bool
+        var cacheWrite1h: Int?
+        var provider: String?
+        var reportedCostUSD: Double?
+        var costSource: String?
+        var pricingTier: String?
+        var serviceTier: String?
+        var speed: String?
+        var inferenceGeo: String?
     }
 
     enum DecodeError: LocalizedError {
@@ -211,8 +258,12 @@ enum RemotePayload {
             return UsageBucket(
                 origin: .server1, cli: cli, model: row.model, day: row.day,
                 tokens: TokenCounts(input: row.input, output: row.output,
-                                    cacheRead: row.cacheRead, cacheWrite: row.cacheWrite),
-                isSidechain: row.sidechain
+                                    cacheRead: row.cacheRead, cacheWrite: row.cacheWrite,
+                                    cacheWrite1h: row.cacheWrite1h ?? 0),
+                isSidechain: row.sidechain,
+                provider: row.provider, reportedCostUSD: row.reportedCostUSD,
+                costSource: row.costSource, pricingTier: row.pricingTier,
+                serviceTier: row.serviceTier, speed: row.speed, inferenceGeo: row.inferenceGeo
             )
         }
     }

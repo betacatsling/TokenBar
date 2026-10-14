@@ -70,7 +70,7 @@ struct SummaryHeader: View {
     /// sentence is in the tooltip.
     private var costDetail: String {
         var parts: [String] = []
-        parts.append(cost.isPartial ? "\(Int(cost.coverage * 100))% 已计价" : "全部已计价")
+        parts.append(cost.isPartial ? "\(Int(cost.coverage * 100))% 已计价" : "均已计价")
         if cost.hasInferred, cost.totalTokens > 0 {
             let share = Int((Double(cost.inferredTokens) / Double(cost.totalTokens) * 100).rounded())
             // Below 1% the rounded share reads "0%", which looks like a bug.
@@ -81,7 +81,7 @@ struct SummaryHeader: View {
 
     /// Spelled out where there is room for it.
     private var costHelp: String {
-        var text = "费用按公开牌价估算，不等于实际账单。"
+        var text = "费用按可用的模型／供应商价格估算，不等于实际账单。计价比例仅针对已采集用量，不代表所有工具都已覆盖。"
         if cost.isPartial {
             text += "\n\(Fmt.compact(cost.unpricedTokens)) token 的模型无公开价，未计入。"
         }

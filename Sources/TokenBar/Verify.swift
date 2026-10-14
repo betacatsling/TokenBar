@@ -11,8 +11,9 @@ import SQLite3
 /// the single easiest number to get wrong.
 enum Verify {
     static func run() {
-        let cache = ScanCache(url: URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("tokenbar-verify-cache.json"))
+        let cachePath = ProcessInfo.processInfo.environment["TOKENBAR_VERIFY_CACHE"]
+            ?? NSTemporaryDirectory() + "tokenbar-verify-cache.json"
+        let cache = ScanCache(url: URL(fileURLWithPath: cachePath))
         // Cold by default so the numbers are reproducible; `--warm` reuses the
         // previous run's cache to measure incremental rescan cost.
         if !CommandLine.arguments.contains("--warm") {
@@ -31,7 +32,7 @@ enum Verify {
         for collector in [ClaudeCodeCollector() as Collector,
                           CodexCollector(),
                           DevinCollector(),
-                          PiCollector()] {
+                          PiCollector(), GeminiCollector(), OpenCodeCollector(), MagpieCollector()] {
             let start = Date()
             let collected = collector.collect(cache: cache)
             let elapsed = Date().timeIntervalSince(start)
@@ -62,6 +63,9 @@ enum Verify {
         print("total_tokens: \(total)")
         print("total_cost_usd: \(String(format: "%.4f", cost.usd))")
         print("unpriced_tokens: \(cost.unpricedTokens)")
+        print("reported_cost_usd: \(String(format: "%.4f", cost.reportedUSD))")
+        print("reported_cost_tokens: \(cost.reportedTokens)")
+        print("missing_codex_logs: \(CoverageReport.inspect(cache: cache).missingCodexLogs)")
         print("buckets: \(merged.count)")
 
         // Per-CLI breakdown, sorted for stable diffing.
@@ -189,6 +193,12 @@ enum Verify {
         }
         func turn(_ model: String) -> String {
             "{\"type\":\"turn_context\",\"timestamp\":\"2026-09-01T00:00:01.000Z\",\"payload\":{\"model\":\"\(model)\"}}"
+        }
+        func modern(_ response: String, total: Int = 100) -> String {
+            "{\"type\":\"token_usage_record\",\"timestamp\":\"2026-09-01T00:00:05Z\",\"payload\":{" +
+            "\"thread_id\":\"modern\",\"response_id\":\"\(response)\"," +
+            "\"usage\":{\"input_tokens\":100,\"cached_input_tokens\":40,\"output_tokens\":10}," +
+            "\"thread_token_usage\":{\"input_tokens\":\(total),\"output_tokens\":10}}}"
         }
         /// `last` is this turn's delta; `total` is the running cumulative.
         /// `input` is inclusive of `cached`, matching Codex.
@@ -350,8 +360,8 @@ enum Verify {
             .joined(separator: "\n") + "\n")
         check("inherited snapshot not charged", fullParse(), 66)
 
-        // 7. Fork baseline: events at or below the parent's historical max are
-        //    replayed history and charge nothing; only what exceeds it counts.
+        // 7. An explicitly known snapshot boundary may prime the reducer.
+        //    Collection uses replay identities, never a parent's later maximum.
         //    Each event's `last` equals its cumulative advance, as in real
         //    rollouts (advance > last only marks inherited bumps).
         write([meta("s9"), turn("gpt-5.5"),
@@ -368,8 +378,64 @@ enum Verify {
         //    Without the baseline the same file counts everything.
         check("same file unbaselined", fullParse(), 616)
 
+        // Modern-only usage must be visible immediately; a later legacy mirror
+        // may use a DIFFERENT cumulative offset (observed on migrated logs).
+        let modernCacheURL = dir.appendingPathComponent("modern-cache.json")
+        var modernCache = ScanCache(url: modernCacheURL)
+        write([meta("modern"), turn("gpt-6-luna"), modern("response-1")]
+            .joined(separator: "\n") + "\n")
+        func modernScan() -> [UsageBucket] {
+            modernCache.resumable(for: path) { p in
+                CodexCollector.scan(path: path, origin: .local, resume: p)
+            }.buckets
+        }
+        check("modern-only luna response", modernScan().reduce(0) { $0 + $1.tokens.total }, 110)
+        modernCache.save(knownPaths: [path])
+        modernCache = ScanCache(url: modernCacheURL)
+        append(usage(last: 100, 10, cached: 40, total: 5100, 510, tcached: 2040, at: 6) + "\n")
+        check("persisted mirror different offset", modernScan().reduce(0) { $0 + $1.tokens.total }, 110)
+        append(modern("response-1") + "\n")
+        check("persisted response ID dedup", modernScan().reduce(0) { $0 + $1.tokens.total }, 110)
+        // The same usage under another response ID is a distinct paid call.
+        // Parse an unterminated tail, then finish it: neither scan may lose or
+        // double count it, and the tail must not persist the response ID early.
+        append(modern("response-2", total: 200))
+        check("modern tail visible", modernScan().reduce(0) { $0 + $1.tokens.total }, 220)
+        append("\n" + usage(last: 100, 10, cached: 40, total: 100, 10, tcached: 40, at: 7) + "\n")
+        let modernBuckets = modernScan()
+        check("modern tail and legacy reset", modernBuckets.reduce(0) { $0 + $1.tokens.total }, 220)
+        check("modern cold equals resumed", fullParse(), 220)
+        check("modern cached subset", modernBuckets.reduce(0) { $0 + $1.tokens.cacheRead }, 80)
+        check("modern model retained", modernBuckets.allSatisfy { $0.model == "gpt-6-luna" } ? 1 : 0, 1)
+
+        // Audit: clamp negative component differences BEFORE the scalar cap.
+        write([meta("regression"), turn("gpt-6-luna"),
+               usage(last: 1000, 0, total: 1000, 0, at: 5),
+               usage(last: 200, 0, total: 100, 1000, at: 10)].joined(separator: "\n") + "\n")
+        check("component regression scalar cap", fullParse(), 1100)
+        let resetHistory = [usage(last: 1000, 0, total: 1000, 0, at: 5),
+                            usage(last: 100, 0, total: 100, 0, at: 10),
+                            usage(last: 100, 0, total: 200, 0, at: 15)]
+        write(([meta("replay"), turn("gpt-6-luna")] + resetHistory + resetHistory +
+               [usage(last: 100, 0, total: 300, 0, at: 20)]).joined(separator: "\n") + "\n")
+        check("replayed resets not rebilled", fullParse(), 1300)
+        write([meta("modern"), turn("gpt-6-luna"), modern("separate"),
+               usage(last: 100, 10, cached: 40, total: 100, 10, at: 30)].joined(separator: "\n") + "\n")
+        check("equal independent modern and legacy", fullParse(), 220)
+        let providerMeta = meta("modern").replacingOccurrences(of: "\"source\":\"vscode\"",
+            with: "\"source\":\"vscode\",\"model_provider\":\"custom-gateway\"")
+        let priority = modern("priority").replacingOccurrences(of: "\"response_id\":\"priority\"",
+            with: "\"response_id\":\"priority\",\"service_tier\":\"priority\"")
+        write([providerMeta, turn("gpt-6-luna"), priority].joined(separator: "\n") + "\n")
+        let metadataBuckets = CodexCollector.scan(path: path, origin: .local,
+            resume: ResumePoint(startOffset: 0, state: nil))?.buckets ?? []
+        check("Codex provider and priority preserved", metadataBuckets.contains {
+            $0.provider == "custom-gateway" && $0.serviceTier == "priority"
+        } ? 1 : 0, 1)
+
         print("----")
         print("resume: RESULT = \(failures.isEmpty ? "PASS" : "FAIL (\(failures.joined(separator: ", ")))")")
+        if !failures.isEmpty { exit(1) }
     }
 
     /// Regression test for the WAL sidecar cache key.
@@ -470,6 +536,7 @@ enum Verify {
     @MainActor
     static func render(path: String) {
         let settings = Settings.scratch()
+        if CommandLine.arguments.contains("--no-remote") { settings.remoteEnabled = false }
         // Allow the host to be overridden so the unreachable-server path can be
         // exercised deliberately.
         if let index = CommandLine.arguments.firstIndex(of: "--host"),

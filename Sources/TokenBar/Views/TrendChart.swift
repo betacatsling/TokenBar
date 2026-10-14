@@ -126,9 +126,18 @@ struct TrendChart: View {
     private var legend: some View {
         // Four names plus four values is close to the panel width; step down
         // rather than truncate a name.
-        ViewThatFits(in: .horizontal) {
-            legendRow(spacing: 12, fontSize: 10)
-            legendRow(spacing: 7, fontSize: 9)
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: hoveredDay == nil ? 65 : 100), alignment: .leading)],
+                  alignment: .leading, spacing: 4) {
+            ForEach(presentCLIs, id: \.self) { cli in
+                HStack(spacing: 4) {
+                    SeriesDot(cli: cli, size: 6)
+                    Text(cli.shortName).foregroundStyle(.secondary)
+                    if let day = hoveredDay {
+                        let value = day.parts[cli] ?? 0
+                        Text(value > 0 ? Fmt.compact(value) : "–").monospacedDigit()
+                    }
+                }.font(.system(size: 10))
+            }
         }
     }
 

@@ -57,6 +57,8 @@ struct UsageSnapshot {
     var scanDuration: TimeInterval
     /// True when subagent (sidechain) traffic is included.
     var includeSidechain: Bool
+    var coverage: CoverageReport = CoverageReport()
+    var billing: BillingLedger = BillingLedger()
 
     static let empty = UsageSnapshot(
         range: .today, buckets: [], pricing: Pricing(), remoteStatus: .idle,
@@ -134,7 +136,10 @@ struct UsageSnapshot {
 final class Aggregator {
     private let cache: ScanCache
     let remote: RemoteCollector
-    private let pricing: Pricing
+    private var pricing: Pricing
+    private var coverage = CoverageReport()
+    private var billing = BillingLedger()
+    private let stateLock = NSLock()
 
     init(cache: ScanCache = ScanCache(),
          remote: RemoteCollector = RemoteCollector(),
@@ -146,7 +151,8 @@ final class Aggregator {
 
     /// Local collectors, in display order.
     private var localCollectors: [Collector] {
-        [ClaudeCodeCollector(), CodexCollector(), DevinCollector(), PiCollector()]
+        [ClaudeCodeCollector(), CodexCollector(), DevinCollector(), PiCollector(),
+         GeminiCollector(), OpenCodeCollector(), MagpieCollector()]
     }
 
     /// Scans the local machine. Safe to call off the main thread.
@@ -161,8 +167,25 @@ final class Aggregator {
             known.formUnion(collector.discoverPaths())
         }
 
-        // Drop cache rows for transcripts that have been deleted.
+        // Persist observed history, including records whose original logs disappeared.
         cache.save(knownPaths: known)
+        let freshPricing = Pricing.loadDefault()
+        var freshCoverage = CoverageReport.inspect(cache: cache)
+        freshCoverage.issues += freshPricing.issues
+        let gateway = MagpieCollector().scanDiagnostics()
+        if gateway.ambiguousMirrors > 0 {
+            freshCoverage.issues.append("Magpie 的 \(gateway.ambiguousMirrors) 条 CLI 镜像／来源不明记录未重复加入")
+        }
+        if gateway.malformedRecords > 0 {
+            freshCoverage.issues.append("Magpie 有 \(gateway.malformedRecords) 条记录无法解析")
+        }
+        let freshBilling = BillingLedger.load()
+        if let issue = freshBilling.issue { freshCoverage.issues.append(issue) }
+        stateLock.lock()
+        pricing = freshPricing
+        coverage = freshCoverage
+        billing = freshBilling
+        stateLock.unlock()
 
         let filtered = includeSidechain ? all : all.filter { !$0.isSidechain }
         return (mergeBuckets(filtered), Date().timeIntervalSince(start))
@@ -177,16 +200,26 @@ final class Aggregator {
                   includeSidechain: Bool,
                   localBuckets: [UsageBucket],
                   remoteBuckets: [UsageBucket],
-                  duration: TimeInterval) -> UsageSnapshot {
-        UsageSnapshot(
+                  duration: TimeInterval,
+                  remoteEnabled: Bool = true) -> UsageSnapshot {
+        stateLock.lock()
+        let currentPricing = pricing, currentBilling = billing
+        var currentCoverage = coverage
+        stateLock.unlock()
+        if remoteEnabled {
+            currentCoverage.issues += remote.diagnostics.map { remote.host + "：" + $0 }
+        }
+        return UsageSnapshot(
             range: range,
-            buckets: mergeBuckets(localBuckets + remoteBuckets),
-            pricing: pricing,
+            buckets: mergeBuckets((localBuckets + remoteBuckets).filter { includeSidechain || !$0.isSidechain }),
+            pricing: currentPricing,
             remoteStatus: remote.status,
             remoteAsOf: remote.lastKnownDate,
             scannedAt: Date(),
             scanDuration: duration,
-            includeSidechain: includeSidechain
+            includeSidechain: includeSidechain,
+            coverage: currentCoverage,
+            billing: currentBilling
         )
     }
 

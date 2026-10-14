@@ -50,6 +50,7 @@ struct CodexUsageVec: Codable, Hashable {
     /// the honest bound, so excess is cut from input first (the largest,
     /// least precise bucket) then output.
     func bounded(to cap: Int) -> CodexUsageVec {
+        if self != clamped() { return clamped().bounded(to: max(0, cap)) }
         guard total > cap else { return self }
         var d = self
         var excess = total - cap
@@ -72,6 +73,11 @@ struct CodexUsageVec: Codable, Hashable {
 struct CodexScanState: Codable, Hashable {
     /// Active model, carried forward from the most recent `turn_context`.
     var model: String = ""
+    var provider: String? = nil
+    var pricingTier: String? = nil
+    var serviceTier: String? = nil
+    var speed: String? = nil
+    var inferenceGeo: String? = nil
     /// First `session_meta` consumed; ancestors' metas replayed by a fork must
     /// not overwrite the identity recorded from the file's own meta.
     var sawSessionMeta: Bool = false
@@ -79,28 +85,72 @@ struct CodexScanState: Codable, Hashable {
     var forkedFromId: String? = nil
     var isSubagent: Bool = false
 
+    /// Modern records identify individual responses. Their thread counter can
+    /// start at a different offset from token_count and must not share its peak.
+    var modernResponseIDs: Set<String> = []
+    var legacyResponseIDs: Set<String> = []
+    var pendingModernUsage: CodexUsageVec? = nil
+    var pendingModernTimestamp: Double? = nil
+    var pendingModernResponseID: String? = nil
+    /// Stable event identities, including inherited history. Persisted so a
+    /// missing parent's retained scan still identifies copied resets.
+    var replayIdentities: Set<String> = []
+    var replaySourceIdentities: Set<String> = []
+
     // Lineage watermarks. `peak`/`peakTotal` are the high-water marks an event's
     // cumulative must beat to charge anything; `prevTotal` is the last accepted
     // cumulative for regression detection; `maxTotal` is the file's historical
-    // maximum, exported to the collector so a fork can start its peak at the
-    // parent's final value.
+    // maximum, retained for diagnostics. It is not a fork boundary.
     var peak: CodexUsageVec = .zero
     var peakTotal: Int = 0
     var prevTotal: Int? = nil
     var maxTotal: CodexUsageVec = .zero
 
-    /// Fork baseline the current result was computed against. Cache hits and
-    /// resumes are only valid while the collector offers the same baseline.
+    /// Explicit boundary or opaque parent-identity dependency cache key.
+    /// Identity-based scans never apply the dependency as a token watermark.
     var baselineUsed: CodexUsageVec? = nil
 
-    /// Prime the watermarks at a parent's historical maximum. Events at or
-    /// below it are the replayed parent history and charge nothing.
+    /// Prime watermarks only at an explicitly known snapshot boundary.
+    /// Never use the parent's final maximum as a inferred fork boundary.
     mutating func applyBaseline(_ baseline: CodexUsageVec?) {
         guard let baseline, baseline.total > 0 else { baselineUsed = nil; return }
         baselineUsed = baseline
         peak = baseline
         peakTotal = baseline.total
         maxTotal = baseline
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case model, provider, pricingTier, serviceTier, speed, inferenceGeo
+        case sawSessionMeta, sessionId, forkedFromId, isSubagent, modernResponseIDs, legacyResponseIDs
+        case pendingModernUsage, pendingModernTimestamp, pendingModernResponseID
+        case replayIdentities, replaySourceIdentities, peak, peakTotal, prevTotal, maxTotal, baselineUsed
+    }
+    init() {}
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        model = try c.decodeIfPresent(String.self, forKey: .model) ?? ""
+        provider = try c.decodeIfPresent(String.self, forKey: .provider)
+        pricingTier = try c.decodeIfPresent(String.self, forKey: .pricingTier)
+        serviceTier = try c.decodeIfPresent(String.self, forKey: .serviceTier)
+        speed = try c.decodeIfPresent(String.self, forKey: .speed)
+        inferenceGeo = try c.decodeIfPresent(String.self, forKey: .inferenceGeo)
+        sawSessionMeta = try c.decodeIfPresent(Bool.self, forKey: .sawSessionMeta) ?? false
+        sessionId = try c.decodeIfPresent(String.self, forKey: .sessionId) ?? ""
+        forkedFromId = try c.decodeIfPresent(String.self, forKey: .forkedFromId)
+        isSubagent = try c.decodeIfPresent(Bool.self, forKey: .isSubagent) ?? false
+        modernResponseIDs = try c.decodeIfPresent(Set<String>.self, forKey: .modernResponseIDs) ?? []
+        legacyResponseIDs = try c.decodeIfPresent(Set<String>.self, forKey: .legacyResponseIDs) ?? []
+        pendingModernUsage = try c.decodeIfPresent(CodexUsageVec.self, forKey: .pendingModernUsage)
+        pendingModernTimestamp = try c.decodeIfPresent(Double.self, forKey: .pendingModernTimestamp)
+        pendingModernResponseID = try c.decodeIfPresent(String.self, forKey: .pendingModernResponseID)
+        replayIdentities = try c.decodeIfPresent(Set<String>.self, forKey: .replayIdentities) ?? []
+        replaySourceIdentities = try c.decodeIfPresent(Set<String>.self, forKey: .replaySourceIdentities) ?? []
+        peak = try c.decodeIfPresent(CodexUsageVec.self, forKey: .peak) ?? .zero
+        peakTotal = try c.decodeIfPresent(Int.self, forKey: .peakTotal) ?? 0
+        prevTotal = try c.decodeIfPresent(Int.self, forKey: .prevTotal)
+        maxTotal = try c.decodeIfPresent(CodexUsageVec.self, forKey: .maxTotal) ?? .zero
+        baselineUsed = try c.decodeIfPresent(CodexUsageVec.self, forKey: .baselineUsed)
     }
 }
 
@@ -110,8 +160,8 @@ struct CodexScanState: Codable, Hashable {
 ///
 /// 1. **Peak gate.** A snapshot whose cumulative does not exceed the lineage
 ///    peak charges nothing. Re-emitted `token_count` rows and fork-replayed
-///    parent history (all at or below the parent's final cumulative) collapse
-///    here without needing timestamp heuristics.
+///    history collapse here. Copied resets are filtered by persisted event
+///    identities in the collector before they can restart the counter again.
 /// 2. **`min(last, advance)`.** The honest increment is `last_token_usage` —
 ///    but only when it does not exceed the cumulative advance. Pre-0.142 Codex
 ///    inflated `last` by up to ~2x (measured: this machine's oldest rollouts
@@ -164,9 +214,8 @@ enum CodexLineage {
             // Rule 2: `last` is trusted only as a bounded increment; when it
             // exceeds the cumulative advance (inflated writes) the component
             // diff is used instead, still capped by the scalar advance.
-            let d = (l.total <= advance
-                     ? l
-                     : (t - state.peak).bounded(to: advance)).clamped()
+            let d = (l.total <= advance ? l : (t - state.peak))
+                .clamped().bounded(to: advance)
             state.peakTotal = t.total
             state.peak = state.peak.componentMax(t)
             return d.total > 0 ? d : nil

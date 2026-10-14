@@ -47,6 +47,25 @@ struct PopoverView: View {
                               range: model.range,
                               loading: awaitingFirstScan)
 
+                if model.snapshot.totalCost.reportedTokens > 0 {
+                    HStack {
+                        Text("日志记录费用（部分）")
+                        Spacer()
+                        Text("≈ " + Fmt.usd(model.snapshot.totalCost.reportedUSD)).monospacedDigit()
+                    }
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                    .help("仅汇总日志中非零费用记录，可能是客户端估算；不与上方估算重复相加，也不代表账单。")
+                }
+                if !model.snapshot.billing.charges(in: model.range).isEmpty {
+                    HStack {
+                        Text("已导入账单")
+                        Spacer()
+                        Text(Fmt.usd(model.snapshot.billing.usd(in: model.range))).monospacedDigit()
+                    }
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    .help("来自 billing.json 的订阅、API 或工具收费，按账单日期统计；与 token 等价估算分开显示。")
+                }
+
                 TrendChart(days: model.snapshot.dailyStacks(days: 14),
                            inRange: { model.range.contains(day: $0, today: DayFormatter.today()) })
             }
@@ -67,6 +86,15 @@ struct PopoverView: View {
             // offline server1 means every total on screen is short by whatever it
             // contributed, which matters most when the machine list is not visible.
             remoteStatusLine
+            if !model.snapshot.coverage.issues.isEmpty {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "info.circle")
+                    Text("部分用量尚未覆盖 · 设置中查看").lineLimit(1)
+                }
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+                .padding(.horizontal, Theme.inset).padding(.bottom, 8)
+                .help(model.snapshot.coverage.issues.joined(separator: "\n"))
+            }
 
             Divider()
             footer
